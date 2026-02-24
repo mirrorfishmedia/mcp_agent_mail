@@ -239,7 +239,7 @@ class BearerAuthMiddleware(BaseHTTPMiddleware):
     async def dispatch(self, request: Request, call_next: RequestResponseEndpoint):
         if request.method == "OPTIONS":  # allow CORS preflight
             return await call_next(request)
-        if request.url.path.startswith("/health/"):
+        if request.url.path == "/health" or request.url.path.startswith("/health/"):
             return await call_next(request)
         # Allow localhost without Authorization when enabled
         try:
@@ -433,7 +433,7 @@ class SecurityAndRateLimitMiddleware(BaseHTTPMiddleware):
                 self._last_cleanup = now
 
         # Allow CORS preflight and health endpoints
-        if request.method == "OPTIONS" or request.url.path.startswith("/health/"):
+        if request.method == "OPTIONS" or request.url.path == "/health" or request.url.path.startswith("/health/"):
             return await call_next(request)
 
         # Only read/patch body for POST requests. GET (including SSE) must not receive http.request messages.
@@ -1075,6 +1075,10 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
         )
 
     # Health endpoints
+    @fastapi_app.get("/health")
+    async def health() -> JSONResponse:
+        return JSONResponse({"status": "ok"})
+
     @fastapi_app.get("/health/liveness")
     async def liveness() -> JSONResponse:
         return JSONResponse({"status": "alive"})
