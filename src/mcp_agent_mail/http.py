@@ -13,7 +13,7 @@ import logging
 import re
 from collections.abc import MutableMapping
 from datetime import datetime, timezone
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Any, Protocol, cast
 
 import structlog
@@ -21,7 +21,7 @@ import uvicorn
 from fastapi import FastAPI, HTTPException, Request, status
 from fastapi.exception_handlers import http_exception_handler
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
+from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, Response
 from fastapi.staticfiles import StaticFiles
 from sqlalchemy import text
 from sqlalchemy.exc import NoResultFound
@@ -30,15 +30,19 @@ from starlette.types import Receive, Scope, Send
 
 from .app import (
     _expire_stale_file_reservations,
+    _format_cross_project_agent_address,
+    _sender_display_name,
     _tool_metrics_snapshot,
     build_mcp_server,
     get_project_sibling_data,
     refresh_project_sibling_suggestions,
+    sweep_stale_agents,
     update_project_sibling_status,
 )
 from .config import Settings, get_settings
 from .db import ensure_schema, get_session
 from .storage import (
+    ProjectArchive,
     archive_write_lock,
     collect_lock_status,
     ensure_archive,
@@ -49,6 +53,7 @@ from .storage import (
     get_fd_usage,
     get_file_content,
     get_historical_inbox_snapshot,
+    get_lock_telemetry,
     get_message_commit_sha,
     get_recent_commits,
     get_repo_cache_stats,
@@ -68,7 +73,370 @@ async def _project_slug_from_id(pid: int | None) -> str | None:
         return res[0] if res and res[0] else None
 
 
-__all__ = ["build_http_app", "main"]
+async def _ensure_ack_escalation_holder(
+    *,
+    settings: Settings,
+    project_id: int,
+    project_slug: str | None,
+    recipient_agent_id: int,
+    recipient_name: str,
+    claim_name: str,
+    now: datetime,
+    now_naive: datetime,
+) -> tuple[int, str]:
+    """Return the holder identity for ACK escalation, creating the ops holder if needed.
+
+    When a synthetic holder must be created, the DB insert happens first and the
+    archive profile write follows only after the session has closed. This keeps
+    the ACK worker out of the DB->archive lock ordering that can deadlock mixed
+    HTTP and MCP traffic.
+    """
+    holder_agent_id = int(recipient_agent_id)
+    holder_agent_name = recipient_name
+    holder_profile_payload: dict[str, Any] | None = None
+
+    async with get_session() as s_holder:
+        hid_row = await s_holder.execute(
+            text("SELECT id FROM agents WHERE project_id = :pid AND name = :name"),
+            {"pid": project_id, "name": claim_name},
+        )
+        hid = hid_row.scalar_one_or_none()
+        if isinstance(hid, int):
+            return hid, claim_name
+
+        await s_holder.execute(
+            text(
+                "INSERT OR IGNORE INTO agents(project_id, name, program, model, task_description, inception_ts, last_active_ts, attachments_policy, contact_policy) VALUES (:pid, :name, :program, :model, :task, :ts, :ts, :attachments_policy, :contact_policy)"
+            ),
+            {
+                "pid": project_id,
+                "name": claim_name,
+                "program": "ops",
+                "model": "system",
+                "task": "ops-escalation",
+                "ts": now_naive,
+                "attachments_policy": "auto",
+                "contact_policy": "auto",
+            },
+        )
+        await s_holder.commit()
+        hid_row2 = await s_holder.execute(
+            text("SELECT id FROM agents WHERE project_id = :pid AND name = :name"),
+            {"pid": project_id, "name": claim_name},
+        )
+        hid2 = hid_row2.scalar_one_or_none()
+        if isinstance(hid2, int):
+            holder_agent_id = hid2
+            holder_agent_name = claim_name
+            if project_slug:
+                holder_profile_payload = {
+                    "id": holder_agent_id,
+                    "name": holder_agent_name,
+                    "program": "ops",
+                    "model": "system",
+                    "task_description": "ops-escalation",
+                    "inception_ts": now.isoformat(),
+                    "last_active_ts": now.isoformat(),
+                    "project_id": project_id,
+                    "attachments_policy": "auto",
+                    "contact_policy": "auto",
+                }
+
+    if holder_profile_payload is not None and project_slug:
+        archive = await ensure_archive(settings, project_slug)
+        async with archive_write_lock(archive):
+            await write_agent_profile(archive, holder_profile_payload)
+
+    return holder_agent_id, holder_agent_name
+
+
+def _http_sender_identity(
+    *,
+    message_project_id: int | None,
+    sender_name: str | None,
+    sender_project_id: int | None,
+    sender_project_human_key: str | None,
+    sender_project_slug: str | None,
+) -> tuple[str, dict[str, str]]:
+    canonical_sender = (sender_name or "").strip() or "Unknown"
+    sender_display = _sender_display_name(
+        message_project_id=message_project_id,
+        sender_name=canonical_sender,
+        sender_project_id=sender_project_id,
+        sender_project_slug=sender_project_slug,
+    )
+    metadata: dict[str, str] = {"sender_name": canonical_sender}
+    if (
+        message_project_id is None
+        or sender_project_id is None
+        or sender_project_id == message_project_id
+    ):
+        return sender_display, metadata
+    if sender_project_human_key:
+        metadata["sender_project"] = sender_project_human_key
+    if sender_project_slug:
+        metadata["sender_project_slug"] = sender_project_slug
+        metadata["sender_address"] = _format_cross_project_agent_address(
+            sender_project_slug,
+            canonical_sender,
+        )
+    return sender_display, metadata
+
+
+_HTTP_MESSAGE_SUBJECT_SLUG_RE = re.compile(r"[^a-zA-Z0-9]+")
+
+
+def _coerce_http_archive_timestamp(created_ts_raw: Any) -> datetime:
+    try:
+        if isinstance(created_ts_raw, str):
+            text_value = (
+                created_ts_raw.replace("Z", "+00:00")
+                if created_ts_raw.endswith("Z")
+                else created_ts_raw
+            )
+            dt = datetime.fromisoformat(text_value)
+        else:
+            dt = created_ts_raw
+        if not isinstance(dt, datetime):
+            raise TypeError("created timestamp must be a datetime")
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt.astimezone(timezone.utc)
+    except Exception:
+        return datetime.now(timezone.utc)
+
+
+def _build_http_archive_message_filename(created_ts_raw: Any, subject_raw: str, message_id: int) -> tuple[str, str, str]:
+    dt = _coerce_http_archive_timestamp(created_ts_raw)
+    y_dir = dt.strftime("%Y")
+    m_dir = dt.strftime("%m")
+    created_iso = dt.strftime("%Y-%m-%dT%H-%M-%SZ")
+    subject_slug = (
+        _HTTP_MESSAGE_SUBJECT_SLUG_RE.sub("-", subject_raw).strip("-_").lower()[:80]
+        or "message"
+    )
+    return y_dir, m_dir, f"{created_iso}__{subject_slug}__{message_id}.md"
+
+
+async def _delete_messages_from_archive(
+    *,
+    settings: Settings,
+    project_slug: str,
+    messages_to_delete: list[tuple[Any, ...]],
+    recip_map: dict[int, list[str]],
+    commit_message: str,
+) -> int:
+    archive = await ensure_archive(settings, project_slug)
+    git_paths_removed: list[str] = []
+    seen_git_paths: set[str] = set()
+
+    async with archive_write_lock(archive):
+        for mrow in messages_to_delete:
+            msg_id = int(mrow[0])
+            y_dir, m_dir, filename = _build_http_archive_message_filename(
+                mrow[1],
+                str(mrow[2] or ""),
+                msg_id,
+            )
+            sender_name = str(mrow[3] or "")
+
+            candidate_dirs = [
+                archive.root / "messages" / y_dir / m_dir,
+                archive.root / "agents" / sender_name / "outbox" / y_dir / m_dir,
+            ]
+            for recip_name in recip_map.get(msg_id, []):
+                candidate_dirs.append(
+                    archive.root / "agents" / recip_name / "inbox" / y_dir / m_dir
+                )
+
+            for cdir in candidate_dirs:
+                fpath = cdir / filename
+                rel = fpath.relative_to(archive.repo_root).as_posix()
+                try:
+                    await asyncio.to_thread(fpath.unlink)
+                except FileNotFoundError:
+                    continue
+                except OSError:
+                    continue
+                if rel not in seen_git_paths:
+                    seen_git_paths.add(rel)
+                    git_paths_removed.append(rel)
+
+        if git_paths_removed:
+            actor_module = importlib.import_module("git")
+            actor_cls = actor_module.Actor
+            git_actor = actor_cls(
+                settings.storage.git_author_name,
+                settings.storage.git_author_email,
+            )
+            await asyncio.to_thread(
+                archive.repo.index.remove,
+                git_paths_removed,
+                working_tree=False,
+            )
+            await asyncio.to_thread(
+                archive.repo.index.commit,
+                commit_message,
+                author=git_actor,
+                committer=git_actor,
+            )
+
+    return len(git_paths_removed)
+
+
+__all__ = ["build_http_app", "create_app", "main"]
+
+
+class _FastMCPHttpApp(Protocol):
+    def http_app(self, *args: Any, **kwargs: Any) -> FastAPI: ...
+
+
+class _FastAPILifespan(Protocol):
+    def lifespan(self, app: FastAPI) -> Any: ...
+
+
+def _expanduser_resolve_path(path: Path) -> Path:
+    return path.expanduser().resolve()
+
+
+def _path_exists(path: Path) -> bool:
+    return path.exists()
+
+
+def _open_git_repo(repo_root: Path):
+    from git import Repo as GitRepo
+
+    return GitRepo(str(repo_root))
+
+
+async def _open_existing_project_archive(settings: Settings, slug: str) -> ProjectArchive | None:
+    """Open an existing project archive for read-only routes without creating new directories."""
+    repo_root = await asyncio.to_thread(_expanduser_resolve_path, Path(settings.storage.root))
+    if not await asyncio.to_thread(_path_exists, repo_root / ".git"):
+        return None
+    project_root = repo_root / "projects" / slug
+    if not await asyncio.to_thread(_path_exists, project_root):
+        return None
+    repo = await asyncio.to_thread(_open_git_repo, repo_root)
+    return ProjectArchive(
+        settings=settings,
+        slug=slug,
+        root=project_root,
+        repo=repo,
+        lock_path=project_root / ".archive.lock",
+        repo_root=repo_root,
+    )
+
+
+def _collect_retention_quota_report_sync(settings: Settings) -> dict[str, Any]:
+    import datetime as _dt
+    import fnmatch as _fnmatch
+
+    storage_root = _expanduser_resolve_path(Path(settings.storage.root))
+    projects_root = storage_root / "projects"
+    cutoff = _dt.datetime.now(_dt.timezone.utc) - _dt.timedelta(
+        days=int(settings.retention_max_age_days)
+    )
+    old_messages = 0
+    total_attach_bytes = 0
+    per_project_attach: dict[str, int] = {}
+    per_project_inbox_counts: dict[str, int] = {}
+    ignore_patterns = list(getattr(settings, "retention_ignore_project_patterns", []) or [])
+
+    for proj_dir in projects_root.iterdir() if projects_root.exists() else []:
+        if not proj_dir.is_dir():
+            continue
+        proj_name = proj_dir.name
+        if any(_fnmatch.fnmatch(proj_name, pat) for pat in ignore_patterns):
+            continue
+        msg_root = proj_dir / "messages"
+        if msg_root.exists():
+            for ydir in msg_root.iterdir():
+                for mdir in ydir.iterdir() if ydir.is_dir() else []:
+                    for file_path in mdir.iterdir() if mdir.is_dir() else []:
+                        if file_path.suffix.lower() != ".md":
+                            continue
+                        with contextlib.suppress(Exception):
+                            ts = _dt.datetime.fromtimestamp(file_path.stat().st_mtime, _dt.timezone.utc)
+                            if ts < cutoff:
+                                old_messages += 1
+        inbox_root = proj_dir / "agents"
+        if inbox_root.exists():
+            count_inbox = 0
+            for inbox_file in inbox_root.rglob("inbox/*/*/*.md"):
+                with contextlib.suppress(Exception):
+                    if inbox_file.is_file():
+                        count_inbox += 1
+            per_project_inbox_counts[proj_name] = count_inbox
+        att_root = proj_dir / "attachments"
+        if att_root.exists():
+            for attachment_file in att_root.rglob("*.webp"):
+                with contextlib.suppress(Exception):
+                    size_bytes = attachment_file.stat().st_size
+                    total_attach_bytes += size_bytes
+                    per_project_attach[proj_name] = per_project_attach.get(proj_name, 0) + size_bytes
+
+    return {
+        "old_messages": old_messages,
+        "retention_max_age_days": int(settings.retention_max_age_days),
+        "total_attachments_bytes": total_attach_bytes,
+        "quota_limit_bytes": int(settings.quota_attachments_limit_bytes),
+        "per_project_attach": per_project_attach,
+        "per_project_inbox_counts": per_project_inbox_counts,
+    }
+
+
+async def _collect_retention_quota_report(settings: Settings) -> dict[str, Any]:
+    return await asyncio.to_thread(_collect_retention_quota_report_sync, settings)
+
+
+def _collect_archive_guide_stats_sync(settings: Settings) -> dict[str, Any]:
+    import subprocess as _subprocess
+    from itertools import islice
+
+    storage_root = str(_expanduser_resolve_path(Path(settings.storage.root)))
+    repo_root = Path(storage_root)
+    total_commits = "0"
+    project_count = 0
+    repo_size = "0 MB"
+    last_commit_time = "Never"
+
+    if _path_exists(repo_root / ".git"):
+        repo = None
+        try:
+            repo = _open_git_repo(repo_root)
+            commit_count = sum(1 for _ in repo.iter_commits(max_count=10000))
+            total_commits = "10,000+" if commit_count == 10000 else f"{commit_count:,}"
+            last_commit = next(repo.iter_commits(max_count=1), None)
+            last_commit_time = last_commit.authored_datetime.strftime("%b %d, %Y") if last_commit else "Never"
+
+            projects_dir = repo_root / "projects"
+            if projects_dir.exists():
+                project_count = sum(1 for p in islice(projects_dir.iterdir(), 100) if p.is_dir())
+
+            try:
+                result = _subprocess.run(
+                    ["du", "-sh", str(repo_root)],
+                    capture_output=True,
+                    text=True,
+                    timeout=5.0,
+                )
+                repo_size = result.stdout.split()[0] if getattr(result, "returncode", 1) == 0 else "Unknown"
+            except (_subprocess.TimeoutExpired, FileNotFoundError, PermissionError, OSError):
+                repo_size = "Unknown"
+        except Exception:
+            pass
+        finally:
+            if repo is not None:
+                repo.close()
+
+    return {
+        "storage_root": storage_root,
+        "total_commits": total_commits,
+        "project_count": project_count,
+        "repo_size": repo_size,
+        "last_commit_time": last_commit_time,
+    }
 
 
 class _FastMCPHttpApp(Protocol):
@@ -97,6 +465,13 @@ _SLUG_VALIDATOR_RE = re.compile(r"^[a-z0-9_-]+$", re.IGNORECASE)
 _AGENT_NAME_VALIDATOR_RE = re.compile(r"^[A-Za-z0-9]+$")
 _TIMESTAMP_VALIDATOR_RE = re.compile(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}")
 
+_LIKE_ESCAPE_CHAR = "!"
+
+
+def _like_escape(term: str) -> str:
+    """Escape LIKE wildcards for literal substring matching."""
+    return term.replace("!", "!!").replace("%", "!%").replace("_", "!_")
+
 
 def _configure_logging(settings: Settings) -> None:
     """Initialize structlog and stdlib logging formatting."""
@@ -104,7 +479,7 @@ def _configure_logging(settings: Settings) -> None:
     global _LOGGING_CONFIGURED
     if _LOGGING_CONFIGURED:
         return
-    processors = [
+    processors: list[Any] = [
         structlog.contextvars.merge_contextvars,
         structlog.processors.TimeStamper(fmt="iso"),
         structlog.processors.add_log_level,
@@ -210,11 +585,105 @@ def _configure_logging(settings: Settings) -> None:
     _LOGGING_CONFIGURED = True
 
 
+# In-process JWKS cache: avoid refetching the JWKS document on every request
+# (#212). Keyed by JWKS URL; entries expire after _JWKS_CACHE_TTL_SECONDS.
+_JWKS_CACHE_TTL_SECONDS = 300.0
+_jwks_cache: dict[str, tuple[float, Any]] = {}
+_jwks_cache_lock = asyncio.Lock()
+
+
+async def _fetch_jwks(jwks_url: str, *, force: bool = False):
+    """Return a parsed JWKS key set for ``jwks_url``, using a TTL cache.
+
+    On a cache miss/expiry (or when ``force`` is set, e.g. after an unknown
+    ``kid``), the document is refetched. On fetch/parse failure the last good
+    cached key set (if any) is returned so transient outages don't break auth.
+    """
+    from time import monotonic
+
+    jose_mod = importlib.import_module("authlib.jose")
+    JsonWebKey = jose_mod.JsonWebKey
+
+    now = monotonic()
+    async with _jwks_cache_lock:
+        cached = _jwks_cache.get(jwks_url)
+        if cached is not None and not force and (now - cached[0]) < _JWKS_CACHE_TTL_SECONDS:
+            return cached[1]
+
+    try:
+        httpx = importlib.import_module("httpx")
+        AsyncClient = httpx.AsyncClient
+        async with AsyncClient(timeout=5) as client:
+            jwks = (await client.get(jwks_url)).json()
+        key_set = JsonWebKey.import_key_set(jwks)
+    except Exception:
+        # Fall back to any cached (possibly stale) key set on fetch failure.
+        async with _jwks_cache_lock:
+            cached = _jwks_cache.get(jwks_url)
+        return cached[1] if cached is not None else None
+
+    async with _jwks_cache_lock:
+        _jwks_cache[jwks_url] = (monotonic(), key_set)
+    return key_set
+
+
+def _select_jwks_key(key_set, header: dict, algorithms: list[str]):
+    """Resolve the verification key from a JWKS key set by ``kid``.
+
+    Never blindly picks ``keys[0]`` (#211). With a ``kid`` we look it up
+    directly; an unknown ``kid`` returns ``None``. Without a ``kid`` this also
+    returns ``None`` -- the caller falls back to verifying against each
+    algorithm-compatible candidate (see ``_jwks_candidate_keys``) instead.
+    """
+    kid = header.get("kid")
+    if kid:
+        with contextlib.suppress(Exception):
+            return key_set.find_by_kid(kid)
+    return None
+
+
+def _jwks_candidate_keys(key_set, header: dict, algorithms: list[str]) -> list:
+    """Return JWKS keys to try when no ``kid`` is present.
+
+    Filters by signing use and by algorithm compatibility (matching the key's
+    declared ``alg`` when present, otherwise the key type implied by the
+    configured algorithms). Blind ``keys[0]`` selection is never used.
+    """
+    alg_set = {str(a) for a in algorithms}
+    # Map configured JWS algorithms to acceptable JWK key types.
+    kty_for_alg = {
+        "HS": "oct", "RS": "RSA", "PS": "RSA",
+        "ES": "EC", "Ed": "OKP",
+    }
+    wanted_kty = {kty_for_alg[a[:2]] for a in alg_set if a[:2] in kty_for_alg}
+    candidates = []
+    for key in list(getattr(key_set, "keys", []) or []):
+        with contextlib.suppress(Exception):
+            use = key.tokens.get("use") if hasattr(key, "tokens") else None
+            if use not in (None, "sig"):
+                continue
+            key_alg = key.tokens.get("alg") if hasattr(key, "tokens") else None
+            if key_alg is not None and str(key_alg) not in alg_set:
+                continue
+            kty = getattr(key, "kty", None) or (key.tokens.get("kty") if hasattr(key, "tokens") else None)
+            if wanted_kty and kty is not None and kty not in wanted_kty:
+                continue
+            candidates.append(key)
+    return candidates
+
+
 class BearerAuthMiddleware(BaseHTTPMiddleware):
-    def __init__(self, app: FastAPI, token: str, allow_localhost: bool = False) -> None:
+    def __init__(
+        self, app: FastAPI, token: str, allow_localhost: bool = False, jwt_enabled: bool = False
+    ) -> None:
         super().__init__(app)
         self._token = token
         self._allow_localhost = allow_localhost
+        # When JWT auth is also enabled, a static-bearer mismatch must NOT
+        # short-circuit before the inner SecurityAndRateLimitMiddleware gets a
+        # chance to validate a JWT (#210). In that case we accept any Bearer
+        # token here and let the JWT path render the final auth decision.
+        self._jwt_enabled = jwt_enabled
 
     @staticmethod
     def _is_localhost(host: str) -> bool:
@@ -239,22 +708,37 @@ class BearerAuthMiddleware(BaseHTTPMiddleware):
     async def dispatch(self, request: Request, call_next: RequestResponseEndpoint):
         if request.method == "OPTIONS":  # allow CORS preflight
             return await call_next(request)
-        if request.url.path == "/health" or request.url.path.startswith("/health/"):
+        if request.url.path.startswith("/health/") or request.url.path == "/api/health":
             return await call_next(request)
-        # Allow localhost without Authorization when enabled
-        try:
-            client_host = request.client.host if request.client else ""
-        except Exception:
-            client_host = ""
-        # Check for localhost bypass (including IPv4-mapped IPv6 addresses)
-        if self._allow_localhost and self._is_localhost(client_host) and not self._has_forwarded_headers(request):
+        if _localhost_bypass_allowed(
+            request,
+            allow_localhost=self._allow_localhost,
+        ):
             return await call_next(request)
         auth_header = request.headers.get("Authorization", "")
         expected_header = f"Bearer {self._token}"
         # Use constant-time comparison to prevent timing attacks
-        if not hmac.compare_digest(auth_header, expected_header):
-            return JSONResponse({"detail": "Unauthorized"}, status_code=status.HTTP_401_UNAUTHORIZED)
-        return await call_next(request)
+        if hmac.compare_digest(auth_header, expected_header):
+            return await call_next(request)
+        # Static bearer did not match. If JWT auth is enabled, defer to the inner
+        # JWT-validating middleware instead of rejecting here, so EITHER a valid
+        # static bearer OR a valid JWT is accepted (#210).
+        if self._jwt_enabled and auth_header.startswith("Bearer "):
+            return await call_next(request)
+        return JSONResponse({"detail": "Unauthorized"}, status_code=status.HTTP_401_UNAUTHORIZED)
+
+
+def _localhost_bypass_allowed(request: Request, *, allow_localhost: bool) -> bool:
+    """Return whether this request qualifies for localhost auth bypass."""
+    if not allow_localhost:
+        return False
+    try:
+        client_host = request.client.host if request.client else ""
+    except Exception:
+        client_host = ""
+    return BearerAuthMiddleware._is_localhost(client_host) and not BearerAuthMiddleware._has_forwarded_headers(
+        request
+    )
 
 
 class SecurityAndRateLimitMiddleware(BaseHTTPMiddleware):
@@ -319,28 +803,39 @@ class SecurityAndRateLimitMiddleware(BaseHTTPMiddleware):
             if header is None:
                 return None
             key = None
+            candidate_keys: list = []
             if jwks_url:
                 with contextlib.suppress(Exception):
-                    httpx = importlib.import_module("httpx")
-                    AsyncClient = httpx.AsyncClient
-                    async with AsyncClient(timeout=5) as client:
-                        jwks = (await client.get(jwks_url)).json()
-                    key_set = JsonWebKey.import_key_set(jwks)
-                    kid = header.get("kid")
-                    key = key_set.find_by_kid(kid) if kid else key_set.keys[0]
+                    key_set = await _fetch_jwks(jwks_url)
+                    if key_set is None:
+                        return None
+                    if header.get("kid"):
+                        key = _select_jwks_key(key_set, header, algs)
+                        # Unknown kid: the cached JWKS may be stale; force a
+                        # refresh once before giving up (#212).
+                        if key is None:
+                            key_set = await _fetch_jwks(jwks_url, force=True)
+                            if key_set is not None:
+                                key = _select_jwks_key(key_set, header, algs)
+                    else:
+                        # No kid: never blind-pick keys[0]. Try every
+                        # algorithm-compatible key during verification (#211).
+                        candidate_keys = _jwks_candidate_keys(key_set, header, algs)
             elif secret:
                 with contextlib.suppress(Exception):
                     key = JsonWebKey.import_key(secret, {"kty": "oct"})
-            if key is None:
+            keys_to_try = candidate_keys if candidate_keys else ([key] if key is not None else [])
+            if not keys_to_try:
                 return None
-            with contextlib.suppress(Exception):
-                claims = jwt.decode(token, key)
-                if audience:
-                    claims.validate_aud(audience)
-                if issuer and str(claims.get("iss") or "") != issuer:
-                    return None
-                claims.validate()
-                return dict(claims)
+            for candidate in keys_to_try:
+                with contextlib.suppress(Exception):
+                    claims = jwt.decode(token, candidate)
+                    if audience:
+                        claims.validate_aud(audience)
+                    if issuer and str(claims.get("iss") or "") != issuer:
+                        continue
+                    claims.validate()
+                    return dict(claims)
         return None
 
     @staticmethod
@@ -364,17 +859,30 @@ class SecurityAndRateLimitMiddleware(BaseHTTPMiddleware):
             return "other", None
         return "other", None
 
+    @staticmethod
+    def _coerce_rpm(value: object, default: int) -> int:
+        # An explicit 0 disables the limit and must survive (#213); only a
+        # missing/None value falls back to the default. Use a None check rather
+        # than ``value or default`` (which would turn 0 into ``default``).
+        if value is None:
+            return default
+        with contextlib.suppress(Exception):
+            return int(value)
+        return default
+
     def _rate_limits_for(self, kind: str) -> tuple[int, int]:
         # return (per_minute, burst)
         if kind == "tools":
-            rpm = int(getattr(self.settings.http, "rate_limit_tools_per_minute", 60) or 60)
+            rpm = self._coerce_rpm(getattr(self.settings.http, "rate_limit_tools_per_minute", 60), 60)
             burst = int(getattr(self.settings.http, "rate_limit_tools_burst", 0) or 0)
         elif kind == "resources":
-            rpm = int(getattr(self.settings.http, "rate_limit_resources_per_minute", 120) or 120)
+            rpm = self._coerce_rpm(getattr(self.settings.http, "rate_limit_resources_per_minute", 120), 120)
             burst = int(getattr(self.settings.http, "rate_limit_resources_burst", 0) or 0)
         else:
-            rpm = int(getattr(self.settings.http, "rate_limit_per_minute", 60) or 60)
+            rpm = self._coerce_rpm(getattr(self.settings.http, "rate_limit_per_minute", 60), 60)
             burst = 0
+        # rpm <= 0 means "disabled" (handled by _consume_bucket); don't synthesize
+        # a positive burst that would re-enable limiting.
         burst = int(burst) if burst > 0 else max(1, rpm)
         return rpm, burst
 
@@ -433,7 +941,7 @@ class SecurityAndRateLimitMiddleware(BaseHTTPMiddleware):
                 self._last_cleanup = now
 
         # Allow CORS preflight and health endpoints
-        if request.method == "OPTIONS" or request.url.path == "/health" or request.url.path.startswith("/health/"):
+        if request.method == "OPTIONS" or request.url.path.startswith("/health/") or request.url.path == "/api/health":
             return await call_next(request)
 
         # Only read/patch body for POST requests. GET (including SSE) must not receive http.request messages.
@@ -459,46 +967,45 @@ class SecurityAndRateLimitMiddleware(BaseHTTPMiddleware):
         # JWT auth (if enabled)
         if self._jwt_enabled:
             auth_header = request.headers.get("Authorization", "")
-            if not auth_header.startswith("Bearer "):
-                return JSONResponse({"detail": "Unauthorized"}, status_code=status.HTTP_401_UNAUTHORIZED)
-            token = auth_header.split(" ", 1)[1].strip()
-            claims_dict = await self._decode_jwt(token)
-            if claims_dict is None:
-                return JSONResponse({"detail": "Unauthorized"}, status_code=status.HTTP_401_UNAUTHORIZED)
-            claims = cast(dict[str, Any], claims_dict)
-            request.state.jwt_claims = claims
-            roles_raw = claims.get(self.settings.http.jwt_role_claim, [])
-            if isinstance(roles_raw, str):
-                roles = {roles_raw}
-            elif isinstance(roles_raw, (list, tuple)):
-                roles = {str(r) for r in roles_raw}
-            else:
-                roles = set()
-            if not roles:
+            # #210: when JWT is enabled, a valid *static* bearer is still accepted
+            # as the OR-alternative to a JWT (the outer BearerAuthMiddleware defers
+            # Bearer requests here without distinguishing the two). Check it first so
+            # static-bearer clients keep working once JWT is turned on; a static
+            # bearer is treated exactly as it is when JWT is disabled (default role).
+            static_token = getattr(self.settings.http, "bearer_token", "") or ""
+            if static_token and hmac.compare_digest(auth_header, f"Bearer {static_token}"):
                 roles = {self._default_role}
+            else:
+                if not auth_header.startswith("Bearer "):
+                    return JSONResponse({"detail": "Unauthorized"}, status_code=status.HTTP_401_UNAUTHORIZED)
+                token = auth_header.split(" ", 1)[1].strip()
+                claims_dict = await self._decode_jwt(token)
+                if claims_dict is None:
+                    return JSONResponse({"detail": "Unauthorized"}, status_code=status.HTTP_401_UNAUTHORIZED)
+                claims = cast(dict[str, Any], claims_dict)
+                request.state.jwt_claims = claims
+                roles_raw = claims.get(self.settings.http.jwt_role_claim, [])
+                if isinstance(roles_raw, str):
+                    roles = {roles_raw}
+                elif isinstance(roles_raw, (list, tuple)):
+                    roles = {str(r) for r in roles_raw}
+                else:
+                    roles = set()
+                if not roles:
+                    roles = {self._default_role}
         else:
             roles = {self._default_role}
             # Elevate localhost to writer when unauthenticated localhost is allowed
-            try:
-                client_host = request.client.host if request.client else ""
-            except Exception:
-                client_host = ""
-            if (
-                bool(getattr(self.settings.http, "allow_localhost_unauthenticated", False))
-                and client_host in {"127.0.0.1", "::1", "localhost"}
-                and not BearerAuthMiddleware._has_forwarded_headers(request)
+            if _localhost_bypass_allowed(
+                request,
+                allow_localhost=bool(getattr(self.settings.http, "allow_localhost_unauthenticated", False)),
             ):
                 roles.add("writer")
 
         # RBAC enforcement (skip for localhost when allowed)
-        try:
-            client_host = request.client.host if request.client else ""
-        except Exception:
-            client_host = ""
-        is_local_ok = (
-            bool(getattr(self.settings.http, "allow_localhost_unauthenticated", False))
-            and client_host in {"127.0.0.1", "::1", "localhost"}
-            and not BearerAuthMiddleware._has_forwarded_headers(request)
+        is_local_ok = _localhost_bypass_allowed(
+            request,
+            allow_localhost=bool(getattr(self.settings.http, "allow_localhost_unauthenticated", False)),
         )
         if self._rbac_enabled and not is_local_ok and kind in {"tools", "resources"}:
             is_reader = bool(roles & self._reader_roles)
@@ -542,6 +1049,30 @@ async def readiness_check() -> None:
     await ensure_schema()
     async with get_session() as session:
         await session.execute(text("SELECT 1"))
+
+    # Fail readiness if FD usage from lockfile leaks is critically high.
+    # This gives orchestrators a signal to restart the process before it
+    # becomes completely wedged (issue #116).
+    current, limit = get_fd_usage()
+    if current >= 0 and limit > 0:
+        headroom_pct = (limit - current) / limit
+        if headroom_pct < 0.10:
+            lock_stats = get_lock_telemetry()
+            raise RuntimeError(
+                f"FD exhaustion imminent: {current}/{limit} FDs in use "
+                f"({round(headroom_pct * 100, 1)}% headroom). "
+                f"Lock telemetry: {lock_stats}"
+            )
+
+
+def create_app() -> FastAPI:
+    """Zero-argument ASGI app factory for ``uvicorn ... --factory`` (#214).
+
+    ``build_http_app`` requires a ``Settings`` argument, so it cannot be used
+    directly as a uvicorn ``--factory`` target. This wrapper resolves settings
+    from the environment and builds the app, matching the documented command.
+    """
+    return build_http_app(get_settings())
 
 
 def build_http_app(settings: Settings, server=None) -> FastAPI:
@@ -690,70 +1221,16 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
                                         holder_agent_name = recipient_name
                                         if settings.ack_escalation_claim_holder_name:
                                             claim_name = settings.ack_escalation_claim_holder_name
-                                            async with get_session() as s_holder:
-                                                hid_row = await s_holder.execute(
-                                                    text(
-                                                        "SELECT id FROM agents WHERE project_id = :pid AND name = :name"
-                                                    ),
-                                                    {
-                                                        "pid": project_id,
-                                                        "name": claim_name,
-                                                    },
-                                                )
-                                                hid = hid_row.scalar_one_or_none()
-                                                if isinstance(hid, int):
-                                                    holder_agent_id = hid
-                                                    holder_agent_name = claim_name
-                                                else:
-                                                    # Auto-create ops holder in DB and write profile.json
-                                                    await s_holder.execute(
-                                                        text(
-                                                            "INSERT OR IGNORE INTO agents(project_id, name, program, model, task_description, inception_ts, last_active_ts, attachments_policy, contact_policy) VALUES (:pid, :name, :program, :model, :task, :ts, :ts, :attachments_policy, :contact_policy)"
-                                                        ),
-                                                        {
-                                                            "pid": project_id,
-                                                            "name": claim_name,
-                                                            "program": "ops",
-                                                            "model": "system",
-                                                            "task": "ops-escalation",
-                                                            "ts": now_naive,
-                                                            "attachments_policy": "auto",
-                                                            "contact_policy": "auto",
-                                                        },
-                                                    )
-                                                    await s_holder.commit()
-                                                    hid_row2 = await s_holder.execute(
-                                                        text(
-                                                            "SELECT id FROM agents WHERE project_id = :pid AND name = :name"
-                                                        ),
-                                                        {
-                                                            "pid": project_id,
-                                                            "name": claim_name,
-                                                        },
-                                                    )
-                                                    hid2 = hid_row2.scalar_one_or_none()
-                                                    if isinstance(hid2, int):
-                                                        holder_agent_id = hid2
-                                                        holder_agent_name = claim_name
-                                                        # Write profile.json to archive
-                                                        if project_slug:
-                                                            archive = await ensure_archive(settings, project_slug)
-                                                            async with archive_write_lock(archive):
-                                                                await write_agent_profile(
-                                                                    archive,
-                                                                    {
-                                                                        "id": holder_agent_id,
-                                                                        "name": holder_agent_name,
-                                                                        "program": "ops",
-                                                                        "model": "system",
-                                                                        "task_description": "ops-escalation",
-                                                                        "inception_ts": now.isoformat(),
-                                                                        "last_active_ts": now.isoformat(),
-                                                                        "project_id": project_id,
-                                                                        "attachments_policy": "auto",
-                                                                        "contact_policy": "auto",
-                                                                    },
-                                                                )
+                                            holder_agent_id, holder_agent_name = await _ensure_ack_escalation_holder(
+                                                settings=settings,
+                                                project_id=int(project_id),
+                                                project_slug=project_slug,
+                                                recipient_agent_id=int(agent_id),
+                                                recipient_name=recipient_name,
+                                                claim_name=claim_name,
+                                                now=now,
+                                                now_naive=now_naive,
+                                            )
                                         async with get_session() as s2:
                                             await s2.execute(
                                                 text(
@@ -812,78 +1289,24 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
                 await asyncio.sleep(max(5, settings.tool_metrics_emit_interval_seconds))
 
         async def _worker_retention_quota() -> None:
-            import datetime as _dt
-            from pathlib import Path as _Path
-
             while True:
-                from contextlib import suppress as _suppress
-
-                with _suppress(Exception):
-                    storage_root = _Path(settings.storage.root).expanduser().resolve()
-                    cutoff = _dt.datetime.now(_dt.timezone.utc) - _dt.timedelta(
-                        days=int(settings.retention_max_age_days)
-                    )
-                    old_messages = 0
-                    total_attach_bytes = 0
-                    per_project_attach: dict[str, int] = {}
-                    per_project_inbox_counts: dict[str, int] = {}
-                    # Compile ignore patterns once per loop
-                    import fnmatch as _fnmatch
-
-                    ignore_patterns = list(getattr(settings, "retention_ignore_project_patterns", []) or [])
-                    for proj_dir in storage_root.iterdir() if storage_root.exists() else []:
-                        if not proj_dir.is_dir():
-                            continue
-                        proj_name = proj_dir.name
-                        # Skip test/demo projects in real server runs
-                        if any(_fnmatch.fnmatch(proj_name, pat) for pat in ignore_patterns):
-                            continue
-                        msg_root = proj_dir / "messages"
-                        if msg_root.exists():
-                            for ydir in msg_root.iterdir():
-                                for mdir in ydir.iterdir() if ydir.is_dir() else []:
-                                    for f in mdir.iterdir() if mdir.is_dir() else []:
-                                        if f.suffix.lower() == ".md":
-                                            with _suppress(Exception):
-                                                ts = _dt.datetime.fromtimestamp(f.stat().st_mtime, _dt.timezone.utc)
-                                                if ts < cutoff:
-                                                    old_messages += 1
-                        # Count per-agent inbox files (agents/*/inbox/YYYY/MM/*.md)
-                        inbox_root = proj_dir / "agents"
-                        if inbox_root.exists():
-                            count_inbox = 0
-                            for f in inbox_root.rglob("inbox/*/*/*.md"):
-                                with _suppress(Exception):
-                                    if f.is_file():
-                                        count_inbox += 1
-                            per_project_inbox_counts[proj_name] = count_inbox
-                        att_root = proj_dir / "attachments"
-                        if att_root.exists():
-                            for sub in att_root.rglob("*.webp"):
-                                with _suppress(Exception):
-                                    sz = sub.stat().st_size
-                                    total_attach_bytes += sz
-                                    per_project_attach[proj_name] = per_project_attach.get(proj_name, 0) + sz
+                with contextlib.suppress(Exception):
+                    report = await _collect_retention_quota_report(settings)
                     structlog.get_logger("maintenance").info(
                         "retention_quota_report",
-                        old_messages=old_messages,
-                        retention_max_age_days=int(settings.retention_max_age_days),
-                        total_attachments_bytes=total_attach_bytes,
-                        quota_limit_bytes=int(settings.quota_attachments_limit_bytes),
-                        per_project_attach=per_project_attach,
-                        per_project_inbox_counts=per_project_inbox_counts,
+                        **report,
                     )
                     # Quota alerts
                     limit_b = int(settings.quota_attachments_limit_bytes)
                     inbox_limit = int(settings.quota_inbox_limit_count)
                     if limit_b > 0:
-                        for proj, used in per_project_attach.items():
+                        for proj, used in report["per_project_attach"].items():
                             if used >= limit_b:
                                 structlog.get_logger("maintenance").warning(
                                     "quota_attachments_exceeded", project=proj, used_bytes=used, limit_bytes=limit_b
                                 )
                     if inbox_limit > 0:
-                        for proj, cnt in per_project_inbox_counts.items():
+                        for proj, cnt in report["per_project_inbox_counts"].items():
                             if cnt >= inbox_limit:
                                 structlog.get_logger("maintenance").warning(
                                     "quota_inbox_exceeded", project=proj, inbox_count=cnt, limit=inbox_limit
@@ -898,9 +1321,12 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
             the EMFILE -> socket closed -> unreachable cascade that occurs
             under sustained multi-agent load.
 
+            Also monitors lockfile FD leaks (issue #116) and cleans up
+            deleted-but-open .lock file descriptors.
+
             Thresholds:
             - 30% headroom: warning logged
-            - 20% headroom: proactive cleanup triggered
+            - 20% headroom: proactive cleanup triggered (includes lockfile FDs)
             - 15% headroom: error logged, aggressive cleanup
             """
             _fd_logger = structlog.get_logger("fd_health")
@@ -910,6 +1336,7 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
                     if current >= 0 and limit > 0:
                         headroom_pct = (limit - current) / limit
                         cache_stats = get_repo_cache_stats()
+                        lock_stats = get_lock_telemetry()
 
                         if headroom_pct < 0.15:
                             # Critical: aggressive cleanup
@@ -919,6 +1346,7 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
                                 fd_limit=limit,
                                 headroom_pct=round(headroom_pct * 100, 1),
                                 repo_cache=cache_stats,
+                                lock_telemetry=lock_stats,
                             )
                             freed = proactive_fd_cleanup(threshold=limit)
                             if freed:
@@ -935,6 +1363,7 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
                                 fd_limit=limit,
                                 headroom_pct=round(headroom_pct * 100, 1),
                                 repo_cache=cache_stats,
+                                lock_telemetry=lock_stats,
                             )
                             freed = proactive_fd_cleanup(threshold=int(limit * 0.25))
                             if freed:
@@ -951,10 +1380,34 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
                                 fd_limit=limit,
                                 headroom_pct=round(headroom_pct * 100, 1),
                                 repo_cache=cache_stats,
+                                lock_telemetry=lock_stats,
                             )
                 except Exception:
                     pass
                 await asyncio.sleep(30)
+
+        async def _worker_auto_retire_stale_agents() -> None:
+            log = structlog.get_logger("maintenance.auto_retire")
+            interval = max(60, int(settings.auto_retire_stale_agents_interval_seconds))
+            threshold = max(60, int(settings.auto_retire_stale_agents_threshold_seconds))
+            while True:
+                with contextlib.suppress(Exception):
+                    retired = await sweep_stale_agents(threshold_seconds=threshold)
+                    if retired:
+                        log.info(
+                            "auto_retired_stale_agents",
+                            count=len(retired),
+                            threshold_seconds=threshold,
+                            agents=[
+                                {
+                                    "agent": entry["agent_name"],
+                                    "project": entry["project_key"],
+                                    "last_active_ts": entry["last_active_ts"],
+                                }
+                                for entry in retired
+                            ],
+                        )
+                await asyncio.sleep(interval)
 
         tasks = []
         # FD health monitor always runs - it's critical for preventing EMFILE cascades
@@ -967,15 +1420,19 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
             tasks.append(asyncio.create_task(_worker_tool_metrics()))
         if settings.retention_report_enabled or settings.quota_enabled:
             tasks.append(asyncio.create_task(_worker_retention_quota()))
+        if settings.auto_retire_stale_agents_enabled:
+            tasks.append(asyncio.create_task(_worker_auto_retire_stale_agents()))
         fastapi_app.state._background_tasks = tasks
 
     async def _shutdown() -> None:  # pragma: no cover - service lifecycle
         tasks = getattr(fastapi_app.state, "_background_tasks", [])
         for task in tasks:
             task.cancel()
-        for task in tasks:
+        # Await cancelled tasks with a timeout to prevent shutdown hangs
+        # (aiosqlite cancellation can block indefinitely)
+        if tasks:
             with contextlib.suppress(Exception):
-                await task
+                await asyncio.wait(tasks, timeout=5.0)
 
     from contextlib import asynccontextmanager
 
@@ -990,8 +1447,23 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
             finally:
                 await _shutdown()
 
-    # Now construct FastAPI with the composed lifespan so ASGI transports run it
-    fastapi_app = FastAPI(lifespan=lifespan_context)
+    # Now construct FastAPI with the composed lifespan so ASGI transports run it.
+    # Give the app a real title/version so the auto-generated /openapi.json has a
+    # proper `info` block (derive the version from installed package metadata,
+    # mirroring cli._package_version; never hardcode a value that could drift).
+    def _package_version() -> str:
+        import importlib.metadata as _importlib_metadata
+
+        try:
+            return _importlib_metadata.version("mcp-agent-mail")
+        except _importlib_metadata.PackageNotFoundError:  # pragma: no cover - dev installs
+            return "0.0.0+local"
+
+    fastapi_app = FastAPI(
+        title="MCP Agent Mail",
+        version=_package_version(),
+        lifespan=lifespan_context,
+    )
 
     # Simple request logging (configurable)
     if settings.http.request_log_enabled:
@@ -1000,46 +1472,71 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
         class RequestLoggingMiddleware(BaseHTTPMiddleware):
             async def dispatch(self, request: Request, call_next: RequestResponseEndpoint):
                 start = _time.time()
-                response = await call_next(request)
-                dur_ms = int((_time.time() - start) * 1000)
                 method = request.method
                 path = request.url.path
-                status_code = getattr(response, "status_code", 0)
                 client = request.client.host if request.client else "-"
-                with contextlib.suppress(Exception):
-                    structlog.get_logger("http").info(
-                        "request",
-                        method=method,
-                        path=path,
-                        status=status_code,
-                        duration_ms=dur_ms,
-                        client_ip=client,
-                    )
+                response = None
+                exc: BaseException | None = None
                 try:
-                    rich_console = importlib.import_module("rich.console")
-                    rich_panel = importlib.import_module("rich.panel")
-                    rich_text = importlib.import_module("rich.text")
-                    Console = rich_console.Console
-                    Panel = rich_panel.Panel
-                    Text = rich_text.Text
-                    console = Console(width=100)
-                    title = Text.assemble(
-                        (method, "bold blue"),
-                        ("  "),
-                        (path, "bold white"),
-                        ("  "),
-                        (f"{status_code}", "bold green" if 200 <= status_code < 400 else "bold red"),
-                        ("  "),
-                        (f"{dur_ms}ms", "bold yellow"),
-                    )
-                    body = Text.assemble(
-                        ("client: ", "cyan"),
-                        (client, "white"),
-                    )
-                    console.print(Panel(body, title=title, border_style="dim"))
-                except Exception:
-                    print(f"http method={method} path={path} status={status_code} ms={dur_ms} client={client}")
-                return response
+                    response = await call_next(request)
+                    return response
+                except BaseException as err:
+                    exc = err
+                    raise
+                finally:
+                    # Always emit a log line, even when the handler raised (#215).
+                    dur_ms = int((_time.time() - start) * 1000)
+                    status_code = getattr(response, "status_code", 0) if response is not None else 500
+                    with contextlib.suppress(Exception):
+                        log = structlog.get_logger("http")
+                        if exc is not None:
+                            log.error(
+                                "request",
+                                method=method,
+                                path=path,
+                                status=status_code,
+                                duration_ms=dur_ms,
+                                client_ip=client,
+                                error=repr(exc),
+                            )
+                        else:
+                            log.info(
+                                "request",
+                                method=method,
+                                path=path,
+                                status=status_code,
+                                duration_ms=dur_ms,
+                                client_ip=client,
+                            )
+                    try:
+                        rich_console = importlib.import_module("rich.console")
+                        rich_panel = importlib.import_module("rich.panel")
+                        rich_text = importlib.import_module("rich.text")
+                        Console = rich_console.Console
+                        Panel = rich_panel.Panel
+                        Text = rich_text.Text
+                        console = Console(width=100)
+                        title = Text.assemble(
+                            (method, "bold blue"),
+                            ("  "),
+                            (path, "bold white"),
+                            ("  "),
+                            (f"{status_code}", "bold green" if 200 <= status_code < 400 else "bold red"),
+                            ("  "),
+                            (f"{dur_ms}ms", "bold yellow"),
+                        )
+                        body = Text.assemble(
+                            ("client: ", "cyan"),
+                            (client, "white"),
+                        )
+                        if exc is not None:
+                            body = Text.assemble(body, "\n", ("error: ", "cyan"), (repr(exc), "red"))
+                        console.print(Panel(body, title=title, border_style="dim"))
+                    except Exception:
+                        suffix = f" error={exc!r}" if exc is not None else ""
+                        print(
+                            f"http method={method} path={path} status={status_code} ms={dur_ms} client={client}{suffix}"
+                        )
 
         app_any = cast(Any, fastapi_app)
         app_any.add_middleware(RequestLoggingMiddleware)
@@ -1060,6 +1557,7 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
             BearerAuthMiddleware,
             token=settings.http.bearer_token,
             allow_localhost=bool(getattr(settings.http, "allow_localhost_unauthenticated", False)),
+            jwt_enabled=bool(getattr(settings.http, "jwt_enabled", False)),
         )
 
     # Optional CORS
@@ -1068,7 +1566,7 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
         app_any2 = _cast(_Any, fastapi_app)
         app_any2.add_middleware(
             CORSMiddleware,
-            allow_origins=settings.cors.origins or ["*"],
+            allow_origins=settings.cors.origins or [],
             allow_credentials=settings.cors.allow_credentials,
             allow_methods=settings.cors.allow_methods or ["*"],
             allow_headers=settings.cors.allow_headers or ["*"],
@@ -1101,40 +1599,99 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
             raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail=str(exc)) from exc
         return JSONResponse({"status": "ready"})
 
-    # Well-known OAuth metadata endpoints: return 404 so clients skip OAuth discovery.
-    # Claude Code 2.1.37+ probes these and interprets 200 as "OAuth available",
-    # then Zod-validates expecting issuer/authorization_endpoint/etc. Per RFC 8414,
-    # 404 signals "no OAuth metadata" which is correct when OAuth is disabled.
-    @fastapi_app.get("/.well-known/oauth-authorization-server")
-    async def oauth_meta_root() -> JSONResponse:
+    @fastapi_app.get("/api/health")
+    async def api_health_bypass() -> JSONResponse:
+        """Lightweight health probe that bypasses the MCP transport layer.
+
+        Returns immediately without touching the database or connection pool,
+        so it stays responsive even when the MCP ASGI pipeline is saturated
+        under heavy multi-agent load.
+        """
+        return JSONResponse({"status": "ok", "timestamp": datetime.now(timezone.utc).isoformat()})
+
+    def _oauth_metadata_disabled_response() -> JSONResponse:
         return JSONResponse({"mcp_oauth": False}, status_code=404)
 
-    @fastapi_app.get("/.well-known/oauth-authorization-server/mcp")
-    async def oauth_meta_root_mcp() -> JSONResponse:
-        return JSONResponse({"mcp_oauth": False}, status_code=404)
+    def _register_oauth_metadata_disabled(path: str) -> None:
+        async def _oauth_metadata_disabled() -> JSONResponse:
+            return _oauth_metadata_disabled_response()
 
-    # A minimal stateless ASGI adapter that does not rely on ASGI lifespan management
-    # and runs a fresh StreamableHTTP transport per request.
-    from mcp.server.streamable_http import StreamableHTTPServerTransport
+        fastapi_app.add_api_route(path, _oauth_metadata_disabled, methods=["GET"], include_in_schema=False)
 
-    class StatelessMCPASGIApp:
-        def __init__(self, mcp_server) -> None:
-            self._server = mcp_server
+    # Thin ASGI wrapper that normalizes Accept / Content-Type headers for
+    # MCP clients (some omit Accept entirely) and then delegates to the
+    # SDK's native mcp_http_app which properly coordinates server lifecycle,
+    # request handling, and session management via StreamableHTTPSessionManager.
+    #
+    # In production the parent FastAPI lifespan initializes the session manager
+    # task group before any requests arrive.  In test environments (httpx
+    # ASGITransport) no lifespan events are sent, so the wrapper lazily enters
+    # the MCP app's lifespan on first request to avoid "Task group not
+    # initialized" errors.
+    class _HeaderFixupMCPApp:
+        """Normalize headers then delegate to the native MCP HTTP app."""
+
+        def __init__(self, native_app: FastAPI) -> None:
+            self._app = native_app
+            self._lifespan_entered = False
+            self._lifespan_cm: Any = None
+            self._lifespan_lock: asyncio.Lock | None = None
+
+        async def _ensure_lifespan(self) -> None:
+            """Lazily enter the MCP app's lifespan if not already running.
+
+            This handles test environments where ASGI lifespan events are never
+            sent (e.g. httpx ASGITransport).  In production the parent app's
+            lifespan context already calls mcp_http_app.lifespan, so the
+            session manager's task group will already be initialized and this
+            method is a fast no-op.
+
+            Uses double-check locking to prevent concurrent requests from
+            entering the lifespan context manager twice.
+            """
+            if self._lifespan_entered:
+                return
+            # Lazily create the lock (must be in async context for the
+            # correct event loop).
+            if self._lifespan_lock is None:
+                self._lifespan_lock = asyncio.Lock()
+            async with self._lifespan_lock:
+                if self._lifespan_entered:
+                    return
+                # Check if the session manager is already running (production path)
+                session_mgr = getattr(self._app.state, "session_manager", None)
+                if session_mgr is None:
+                    # Try to find it via route endpoint
+                    for route in getattr(self._app, "routes", []):
+                        endpoint = getattr(route, "endpoint", None)
+                        sm = getattr(endpoint, "session_manager", None)
+                        if sm is not None:
+                            session_mgr = sm
+                            break
+                if session_mgr is not None and getattr(session_mgr, "_task_group", None) is not None:
+                    self._lifespan_entered = True
+                    return
+                # Enter the MCP app's lifespan (test path)
+                mcp_lifespan_app = cast(_FastAPILifespan, self._app)
+                self._lifespan_cm = mcp_lifespan_app.lifespan(self._app)
+                await self._lifespan_cm.__aenter__()
+                self._lifespan_entered = True
 
         async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
             if scope.get("type") != "http":
-                res = JSONResponse({"detail": "Not Found"}, status_code=404)
-                await res(scope, receive, send)
+                # Delegate non-HTTP scopes (e.g. lifespan) directly
+                await self._app(scope, receive, send)
                 return
 
-            # Ensure Accept and Content-Type headers are present per StreamableHTTP expectations
+            await self._ensure_lifespan()
+
             headers = list(scope.get("headers") or [])
 
             def _has_header(key: bytes) -> bool:
                 lk = key.lower()
                 return any(h[0].lower() == lk for h in headers)
 
-            # Ensure both JSON and SSE are present; httpx defaults no Accept header
+            # Ensure both JSON and SSE are accepted; httpx defaults no Accept header
             headers = [(k, v) for (k, v) in headers if k.lower() != b"accept"]
             headers.append((b"accept", b"application/json, text/event-stream"))
             if scope.get("method") == "POST" and not _has_header(b"content-type"):
@@ -1142,34 +1699,7 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
             new_scope = dict(scope)
             new_scope["headers"] = headers
 
-            http_transport = StreamableHTTPServerTransport(
-                mcp_session_id=None,
-                is_json_response_enabled=True,
-                event_store=None,
-                security_settings=None,
-            )
-
-            async with http_transport.connect() as streams:
-                read_stream, write_stream = streams
-                server_task = asyncio.create_task(
-                    self._server._mcp_server.run(
-                        read_stream,
-                        write_stream,
-                        self._server._mcp_server.create_initialization_options(),
-                        stateless=True,
-                    )
-                )
-                # No response wrapping/unwrapping - just pass through MCP responses as-is
-                # MCP clients can handle JSON-RPC format properly
-                try:
-                    await http_transport.handle_request(new_scope, receive, send)
-                finally:
-                    with contextlib.suppress(Exception):
-                        await http_transport.terminate()
-                    if not server_task.done():
-                        server_task.cancel()
-                    with contextlib.suppress(asyncio.CancelledError, Exception):
-                        await server_task
+            await self._app(new_scope, receive, send)
 
     # Mount at both '/base' and '/base/' to tolerate either form from clients/tests.
     # Also mount compatibility aliases for both '/api' and '/mcp' regardless of configured base.
@@ -1178,7 +1708,7 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
         mount_base = "/" + mount_base
     base_no_slash = mount_base.rstrip("/") or "/"
     base_with_slash = base_no_slash if base_no_slash == "/" else base_no_slash + "/"
-    stateless_app = StatelessMCPASGIApp(server)
+    stateless_app = _HeaderFixupMCPApp(mcp_http_app)
 
     mount_paths = [base_no_slash, base_with_slash]
     for compat_base in ("/api", "/mcp"):
@@ -1188,6 +1718,26 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
             mount_paths.append(compat_no_slash)
         if compat_with_slash not in mount_paths:
             mount_paths.append(compat_with_slash)
+
+    oauth_metadata_paths: set[str] = set()
+
+    def _add_oauth_metadata_path(path: str) -> None:
+        normalized = path.rstrip("/") or "/"
+        oauth_metadata_paths.add(normalized)
+        if normalized != "/":
+            oauth_metadata_paths.add(f"{normalized}/")
+
+    _add_oauth_metadata_path("/.well-known/oauth-authorization-server")
+    _add_oauth_metadata_path("/.well-known/oauth-authorization-server/mcp")
+    for mount_path in mount_paths:
+        normalized = mount_path.rstrip("/") or "/"
+        if normalized == "/":
+            continue
+        _add_oauth_metadata_path(f"{normalized}/.well-known/oauth-authorization-server")
+        _add_oauth_metadata_path(f"{normalized}/.well-known/oauth-authorization-server/mcp")
+        _add_oauth_metadata_path(f"/.well-known/oauth-authorization-server{normalized}")
+    for path in sorted(oauth_metadata_paths):
+        _register_oauth_metadata_disabled(path)
 
     for mount_path in mount_paths:
         with contextlib.suppress(Exception):
@@ -1221,18 +1771,17 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
 
             # If localhost and allow_localhost_unauthenticated, synthesize Authorization header automatically
             scope = dict(request.scope)
-            try:
-                client_host = request.client.host if request.client else ""
-            except Exception:
-                client_host = ""
-            if settings.http.allow_localhost_unauthenticated and client_host in {"127.0.0.1", "::1", "localhost"}:
+            if _localhost_bypass_allowed(
+                request,
+                allow_localhost=bool(settings.http.allow_localhost_unauthenticated),
+            ):
                 scope_headers = list(scope.get("headers") or [])
                 has_auth = any(k.lower() == b"authorization" for k, _ in scope_headers)
                 if not has_auth and settings.http.bearer_token:
                     scope_headers.append((b"authorization", f"Bearer {settings.http.bearer_token}".encode("latin1")))
                 scope["headers"] = scope_headers
             await stateless_app(
-                {**scope, "path": base_path_with_slash},  # ensure mounted path
+                {**scope, "path": "/"},  # MCP app expects requests at its root
                 request.receive,
                 _send,
             )
@@ -1353,7 +1902,7 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
                 return '"' + s.replace('"', '""') + '"'
 
             def _like_escape(term: str) -> str:
-                return term.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+                return term.replace("!", "!!").replace("%", "!%").replace("_", "!_")
 
             for p in parts:
                 key = None
@@ -1423,7 +1972,11 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
                             m.created_ts,
                             m.importance,
                             m.thread_id,
+                            m.project_id AS message_project_id,
                             sender.name AS sender_name,
+                            sender.project_id AS sender_project_id,
+                            sp.human_key AS sender_project_name,
+                            sp.slug AS sender_project_slug,
                             p.slug AS project_slug,
                             p.human_key AS project_name,
                             COALESCE(
@@ -1441,6 +1994,7 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
                             ) AS recipients
                         FROM messages m
                         JOIN agents sender ON m.sender_id = sender.id
+                        LEFT JOIN projects sp ON sp.id = sender.project_id
                         JOIN projects p ON m.project_id = p.id
                         ORDER BY m.created_ts DESC
                         LIMIT :limit
@@ -1449,15 +2003,15 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
 
                     rows = await session.execute(query, {"limit": safe_limit})
 
-                    for r in rows.fetchall():
-                        body = r[2] or ""
-                        raw_body_length = r[3]
+                    for r in rows.mappings().all():
+                        body = r["body_md"] or ""
+                        raw_body_length = r["body_length"]
                         body_length = int(raw_body_length) if raw_body_length is not None else len(body)
                         excerpt = body[:150].replace('#', '').replace('*', '').replace('`', '').strip()
                         if body_length > 150:
                             excerpt += "..."
 
-                        created_ts = r[4]
+                        created_ts = r["created_ts"]
                         if isinstance(created_ts, str):
                             created_dt = datetime.fromisoformat(created_ts.replace('Z', '+00:00'))
                         else:
@@ -1486,27 +2040,34 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
                         else:
                             created_relative = "Just now"
 
-                        messages.append(
-                            {
-                                "id": r[0],
-                                "subject": r[1] or "(No subject)",
-                                "body_md": body,
-                                "body_length": body_length,
-                                "excerpt": excerpt,
-                                "created_ts": str(r[4]),
-                                "created_full": created_dt.strftime("%B %d, %Y at %I:%M %p"),
-                                "created_relative": created_relative,
-                                "importance": r[5] or "normal",
-                                "thread_id": r[6],
-                                "sender": r[7],
-                                "project_slug": r[8],
-                                "project_name": r[9],
-                                "recipients": ", ".join(
-                                    part.strip() for part in (r[10] or "").split(",") if part.strip()
-                                ),
-                                "read": False,
-                            }
+                        sender_display, sender_meta = _http_sender_identity(
+                            message_project_id=r["message_project_id"],
+                            sender_name=r["sender_name"],
+                            sender_project_id=r["sender_project_id"],
+                            sender_project_human_key=r["sender_project_name"],
+                            sender_project_slug=r["sender_project_slug"],
                         )
+                        message_payload = {
+                            "id": r["id"],
+                            "subject": r["subject"] or "(No subject)",
+                            "body_md": body,
+                            "body_length": body_length,
+                            "excerpt": excerpt,
+                            "created_ts": str(r["created_ts"]),
+                            "created_full": created_dt.strftime("%B %d, %Y at %I:%M %p"),
+                            "created_relative": created_relative,
+                            "importance": r["importance"] or "normal",
+                            "thread_id": r["thread_id"],
+                            "sender": sender_display,
+                            "project_slug": r["project_slug"],
+                            "project_name": r["project_name"],
+                            "recipients": ", ".join(
+                                part.strip() for part in (r["recipients"] or "").split(",") if part.strip()
+                            ),
+                            "read": False,
+                        }
+                        message_payload.update(sender_meta)
+                        messages.append(message_payload)
 
                     if include_projects:
                         rows = await session.execute(
@@ -1578,6 +2139,9 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
                         detail=f"Too many messages ({len(message_ids)}). Maximum is 500."
                     )
 
+                deleted_count = 0
+                messages_by_project: dict[str, list[tuple[Any, ...]]] = {}
+                recip_map: dict[int, list[str]] = {}
                 async with get_session() as session:
                     placeholders = ','.join([f':mid{i}' for i in range(len(message_ids))])
                     id_params: dict[str, Any] = {f"mid{i}": mid for i, mid in enumerate(message_ids)}
@@ -1596,7 +2160,7 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
                         ),
                         id_params,
                     )
-                    messages_to_delete = rows.fetchall()
+                    messages_to_delete = [tuple(row) for row in rows.fetchall()]
 
                     if not messages_to_delete:
                         return JSONResponse({"success": True, "deleted_count": 0})
@@ -1613,9 +2177,12 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
                         ),
                         id_params,
                     )
-                    recip_map: dict[int, list[str]] = {}
                     for rr in recip_rows.fetchall():
                         recip_map.setdefault(int(rr[0]), []).append(rr[1])
+
+                    for mrow in messages_to_delete:
+                        slug = str(mrow[4])
+                        messages_by_project.setdefault(slug, []).append(mrow)
 
                     # Delete from SQLite
                     await session.execute(
@@ -1627,106 +2194,25 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
                         id_params,
                     )
                     deleted_count = int(getattr(del_result, "rowcount", 0) or 0)
-
-                    # Delete markdown files from Git archive
-                    settings = get_settings()
-                    total_git_files_removed = 0
-                    import re as _re
-
-                    _SUBJECT_SLUG_RE = _re.compile(r"[^a-zA-Z0-9]+")
-
-                    # Group messages by project for archive access
-                    by_project: dict[str, list[Any]] = {}
-                    for mrow in messages_to_delete:
-                        slug = str(mrow[4])
-                        by_project.setdefault(slug, []).append(mrow)
-
-                    for project_slug, proj_msgs in by_project.items():
-                        git_paths_removed: list[str] = []
-                        try:
-                            archive = await ensure_archive(settings, project_slug)
-                            for mrow in proj_msgs:
-                                msg_id = int(mrow[0])
-                                created_ts_raw = mrow[1]
-                                subject_raw = str(mrow[2] or "")
-                                sender_name = str(mrow[3] or "")
-
-                                try:
-                                    if isinstance(created_ts_raw, str):
-                                        dt = datetime.fromisoformat(
-                                            created_ts_raw.replace("Z", "+00:00")
-                                            if created_ts_raw.endswith("Z")
-                                            else created_ts_raw
-                                        )
-                                    else:
-                                        dt = created_ts_raw
-                                    if dt.tzinfo is None:
-                                        dt = dt.replace(tzinfo=timezone.utc)
-                                except Exception:
-                                    dt = datetime.now(timezone.utc)
-
-                                y_dir = dt.strftime("%Y")
-                                m_dir = dt.strftime("%m")
-                                created_iso = dt.astimezone(timezone.utc).strftime(
-                                    "%Y-%m-%dT%H-%M-%SZ"
-                                )
-                                subject_slug = (
-                                    _SUBJECT_SLUG_RE.sub("-", subject_raw)
-                                    .strip("-_")
-                                    .lower()[:80]
-                                    or "message"
-                                )
-                                filename = f"{created_iso}__{subject_slug}__{msg_id}.md"
-
-                                candidate_dirs = [
-                                    archive.root / "messages" / y_dir / m_dir,
-                                    archive.root / "agents" / sender_name / "outbox" / y_dir / m_dir,
-                                ]
-                                for recip_name in recip_map.get(msg_id, []):
-                                    candidate_dirs.append(
-                                        archive.root / "agents" / recip_name / "inbox" / y_dir / m_dir
-                                    )
-
-                                for cdir in candidate_dirs:
-                                    fpath = cdir / filename
-                                    if fpath.exists():
-                                        rel = fpath.relative_to(archive.repo_root).as_posix()
-                                        try:
-                                            fpath.unlink()
-                                            git_paths_removed.append(rel)
-                                        except OSError:
-                                            pass
-
-                            # Commit removals for this project's archive
-                            if git_paths_removed:
-                                try:
-                                    actor_module = importlib.import_module("git")
-                                    actor_cls = getattr(actor_module, "Actor")
-                                    git_actor = actor_cls(
-                                        settings.storage.git_author_name,
-                                        settings.storage.git_author_email,
-                                    )
-                                    archive.repo.index.remove(
-                                        git_paths_removed, working_tree=False
-                                    )
-                                    archive.repo.index.commit(
-                                        f"delete: {len(proj_msgs)} message(s) via web UI\n",
-                                        author=git_actor,
-                                        committer=git_actor,
-                                    )
-                                    total_git_files_removed += len(git_paths_removed)
-                                except Exception as git_exc:
-                                    logging.getLogger(__name__).warning(
-                                        "Git commit for message deletion failed: %s", git_exc
-                                    )
-                        except Exception as archive_exc:
-                            logging.getLogger(__name__).warning(
-                                "Git archive cleanup failed for project %s: %s",
-                                project_slug,
-                                archive_exc,
-                            )
-
                     await session.commit()
+
+                settings = get_settings()
+                total_git_files_removed = 0
+                for project_slug, proj_msgs in messages_by_project.items():
+                    try:
+                        total_git_files_removed += await _delete_messages_from_archive(
+                            settings=settings,
+                            project_slug=project_slug,
+                            messages_to_delete=proj_msgs,
+                            recip_map=recip_map,
+                            commit_message=f"delete: {len(proj_msgs)} message(s) via web UI\n",
+                        )
+                    except Exception as archive_exc:
+                        logging.getLogger(__name__).warning(
+                            "Git archive cleanup failed for project %s: %s",
+                            project_slug,
+                            archive_exc,
+                        )
 
                 return JSONResponse({
                     "success": True,
@@ -1883,6 +2369,8 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
             order: str | None = None,
             boost: int | None = None,
         ) -> HTMLResponse:
+            if order not in ("relevance", "time", None):
+                order = "relevance"
             await ensure_schema()
             async with get_session() as session:
                 proj = await session.execute(
@@ -1904,9 +2392,14 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
                     fts_expr, like_pat, like_scope, tokens = _parse_fts_query(q, scope)
                     weights = (0.0, 3.0, 1.0) if (boost or 0) else (0.0, 1.0, 1.0)
                     fts_sql = (
-                        "SELECT m.id, m.subject, s.name, m.created_ts, m.importance, m.thread_id, "
+                        "SELECT m.id, m.subject, s.name AS sender_name, s.project_id AS sender_project_id, "
+                        "sp.human_key AS sender_project_name, sp.slug AS sender_project_slug, "
+                        "m.created_ts, m.importance, m.thread_id, "
                         "snippet(fts_messages, 2, '<mark>', '</mark>', '…', 18) AS body_snippet "
-                        "FROM fts_messages JOIN messages m ON m.id = fts_messages.rowid JOIN agents s ON s.id = m.sender_id "
+                        "FROM fts_messages "
+                        "JOIN messages m ON m.id = fts_messages.rowid "
+                        "JOIN agents s ON s.id = m.sender_id "
+                        "LEFT JOIN projects sp ON sp.id = s.project_id "
                         "WHERE m.project_id = :pid AND fts_messages MATCH :q "
                         + (
                             "ORDER BY m.created_ts DESC "
@@ -1917,41 +2410,82 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
                     )
                     try:
                         search = await session.execute(text(fts_sql), {"pid": pid, "q": fts_expr or q})
-                        matched_messages = [
-                            {
-                                "id": r[0],
-                                "subject": r[1],
-                                "sender": r[2],
-                                "created": str(r[3]),
-                                "importance": r[4],
-                                "thread_id": r[5],
-                                "snippet": r[6],
-                                "hits": (r[6] or "").count("<mark>"),
+                        matched_messages = []
+                        for r in search.mappings().all():
+                            sender_display, sender_meta = _http_sender_identity(
+                                message_project_id=pid,
+                                sender_name=r["sender_name"],
+                                sender_project_id=r["sender_project_id"],
+                                sender_project_human_key=r["sender_project_name"],
+                                sender_project_slug=r["sender_project_slug"],
+                            )
+                            item = {
+                                "id": r["id"],
+                                "subject": r["subject"],
+                                "sender": sender_display,
+                                "created": str(r["created_ts"]),
+                                "importance": r["importance"],
+                                "thread_id": r["thread_id"],
+                                "snippet": r["body_snippet"],
+                                "hits": (r["body_snippet"] or "").count("<mark>"),
                             }
-                            for r in search.fetchall()
-                        ]
+                            item.update(sender_meta)
+                            matched_messages.append(item)
                     except Exception:
                         # Fallback to LIKE if FTS not available
                         if like_scope == "subject":
-                            like_sql = "SELECT m.id, m.subject, s.name, m.created_ts, m.importance, m.thread_id FROM messages m JOIN agents s ON s.id = m.sender_id WHERE m.project_id = :pid AND m.subject LIKE :pat ESCAPE '\\' ORDER BY m.created_ts DESC LIMIT 10000"
+                            like_sql = (
+                                "SELECT m.id, m.subject, s.name AS sender_name, s.project_id AS sender_project_id, "
+                                "sp.human_key AS sender_project_name, sp.slug AS sender_project_slug, "
+                                "m.created_ts, m.importance, m.thread_id "
+                                "FROM messages m JOIN agents s ON s.id = m.sender_id "
+                                "LEFT JOIN projects sp ON sp.id = s.project_id "
+                                f"WHERE m.project_id = :pid AND m.subject LIKE :pat ESCAPE '{_LIKE_ESCAPE_CHAR}' "
+                                "ORDER BY m.created_ts DESC LIMIT 10000"
+                            )
                         elif like_scope == "body":
-                            like_sql = "SELECT m.id, m.subject, s.name, m.created_ts, m.importance, m.thread_id FROM messages m JOIN agents s ON s.id = m.sender_id WHERE m.project_id = :pid AND m.body_md LIKE :pat ESCAPE '\\' ORDER BY m.created_ts DESC LIMIT 10000"
+                            like_sql = (
+                                "SELECT m.id, m.subject, s.name AS sender_name, s.project_id AS sender_project_id, "
+                                "sp.human_key AS sender_project_name, sp.slug AS sender_project_slug, "
+                                "m.created_ts, m.importance, m.thread_id "
+                                "FROM messages m JOIN agents s ON s.id = m.sender_id "
+                                "LEFT JOIN projects sp ON sp.id = s.project_id "
+                                f"WHERE m.project_id = :pid AND m.body_md LIKE :pat ESCAPE '{_LIKE_ESCAPE_CHAR}' "
+                                "ORDER BY m.created_ts DESC LIMIT 10000"
+                            )
                         else:
-                            like_sql = "SELECT m.id, m.subject, s.name, m.created_ts, m.importance, m.thread_id FROM messages m JOIN agents s ON s.id = m.sender_id WHERE m.project_id = :pid AND (m.subject LIKE :pat ESCAPE '\\' OR m.body_md LIKE :pat ESCAPE '\\') ORDER BY m.created_ts DESC LIMIT 10000"
-                        search = await session.execute(text(like_sql), {"pid": pid, "pat": like_pat or f"%{q}%"})
-                        matched_messages = [
-                            {
-                                "id": r[0],
-                                "subject": r[1],
-                                "sender": r[2],
-                                "created": str(r[3]),
-                                "importance": r[4],
-                                "thread_id": r[5],
+                            like_sql = (
+                                "SELECT m.id, m.subject, s.name AS sender_name, s.project_id AS sender_project_id, "
+                                "sp.human_key AS sender_project_name, sp.slug AS sender_project_slug, "
+                                "m.created_ts, m.importance, m.thread_id "
+                                "FROM messages m JOIN agents s ON s.id = m.sender_id "
+                                "LEFT JOIN projects sp ON sp.id = s.project_id "
+                                f"WHERE m.project_id = :pid AND (m.subject LIKE :pat ESCAPE '{_LIKE_ESCAPE_CHAR}' "
+                                f"OR m.body_md LIKE :pat ESCAPE '{_LIKE_ESCAPE_CHAR}') "
+                                "ORDER BY m.created_ts DESC LIMIT 10000"
+                            )
+                        search = await session.execute(text(like_sql), {"pid": pid, "pat": like_pat or f"%{_like_escape(q)}%"})
+                        matched_messages = []
+                        for r in search.mappings().all():
+                            sender_display, sender_meta = _http_sender_identity(
+                                message_project_id=pid,
+                                sender_name=r["sender_name"],
+                                sender_project_id=r["sender_project_id"],
+                                sender_project_human_key=r["sender_project_name"],
+                                sender_project_slug=r["sender_project_slug"],
+                            )
+                            item = {
+                                "id": r["id"],
+                                "subject": r["subject"],
+                                "sender": sender_display,
+                                "created": str(r["created_ts"]),
+                                "importance": r["importance"],
+                                "thread_id": r["thread_id"],
                                 "snippet": "",
                                 "hits": 0,
                             }
-                            for r in search.fetchall()
-                        ]
+                            item.update(sender_meta)
+                            matched_messages.append(item)
             return await _render(
                 "mail_project.html",
                 project={"id": pid, "slug": prow[1], "human_key": prow[2], "archived_at": project_archived_at},
@@ -2003,6 +2537,7 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
         @fastapi_app.get("/mail/unified-inbox", response_class=HTMLResponse)
         async def unified_inbox(limit: int = 10000, filter_importance: str | None = None) -> HTMLResponse:
             """Unified inbox showing messages from all active agents across all projects."""
+            limit = min(max(1, limit), 10000)
             await ensure_schema()
             async with get_session() as session:
                 # Get all projects with their agents
@@ -2073,8 +2608,12 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
                         f"""
                     SELECT
                         m.id, m.subject, m.body_md, m.created_ts, m.importance, m.thread_id,
+                        m.project_id AS message_project_id,
                         p.slug, p.human_key,
                         sender.name as sender_name,
+                        sender.project_id AS sender_project_id,
+                        sp.human_key AS sender_project_name,
+                        sp.slug AS sender_project_slug,
                         COALESCE(
                             (
                                 SELECT GROUP_CONCAT(name, ', ')
@@ -2092,6 +2631,7 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
                     FROM messages m
                     JOIN projects p ON p.id = m.project_id
                     JOIN agents sender ON sender.id = m.sender_id
+                    LEFT JOIN projects sp ON sp.id = sender.project_id
                     LEFT JOIN message_recipients mr ON mr.message_id = m.id
                     LEFT JOIN agents recip ON recip.id = mr.agent_id
                     LEFT JOIN messages m2 ON (
@@ -2102,7 +2642,7 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
                     )
                     {where_clause}
                     GROUP BY m.id, m.subject, m.body_md, m.created_ts, m.importance, m.thread_id,
-                             p.slug, p.human_key, sender.name
+                             m.project_id, p.slug, p.human_key, sender.name, sender.project_id, sp.human_key, sp.slug
                     ORDER BY m.created_ts DESC
                     LIMIT :lim
                     """
@@ -2111,22 +2651,29 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
                 )
 
                 messages = []
-                for r in messages_query.fetchall():
-                    messages.append(
-                        {
-                            "id": int(r[0]),
-                            "subject": r[1],
-                            "body_md": r[2] or "",
-                            "created": str(r[3]),
-                            "importance": r[4] or "normal",
-                            "thread_id": r[5],
-                            "project_slug": r[6],
-                            "project_name": r[7],
-                            "sender": r[8],
-                            "recipients": r[9] or "",
-                            "thread_count": int(r[10] or 0),
-                        }
+                for r in messages_query.mappings().all():
+                    sender_display, sender_meta = _http_sender_identity(
+                        message_project_id=r["message_project_id"],
+                        sender_name=r["sender_name"],
+                        sender_project_id=r["sender_project_id"],
+                        sender_project_human_key=r["sender_project_name"],
+                        sender_project_slug=r["sender_project_slug"],
                     )
+                    item = {
+                        "id": int(r["id"]),
+                        "subject": r["subject"],
+                        "body_md": r["body_md"] or "",
+                        "created": str(r["created_ts"]),
+                        "importance": r["importance"] or "normal",
+                        "thread_id": r["thread_id"],
+                        "project_slug": r["slug"],
+                        "project_name": r["human_key"],
+                        "sender": sender_display,
+                        "recipients": r["recipient_names"] or "",
+                        "thread_count": int(r["thread_count"] or 0),
+                    }
+                    item.update(sender_meta)
+                    messages.append(item)
 
             return await _render(
                 "mail_unified_inbox.html",
@@ -2139,6 +2686,8 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
 
         @fastapi_app.get("/mail/{project}/inbox/{agent}", response_class=HTMLResponse)
         async def mail_inbox(project: str, agent: str, limit: int = 10000, page: int = 1) -> HTMLResponse:
+            limit = min(max(1, limit), 10000)
+            page = min(max(1, page), 10000)
             await ensure_schema()
             async with get_session() as session:
                 prow = (
@@ -2162,11 +2711,24 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
                 inbox_rows = await session.execute(
                     text(
                         """
-                    SELECT m.id, m.subject, s.name, m.created_ts, m.importance, m.thread_id
+                    SELECT
+                        m.id,
+                        m.subject,
+                        s.name AS sender_name,
+                        s.project_id AS sender_project_id,
+                        sp.human_key AS sender_project_name,
+                        sp.slug AS sender_project_slug,
+                        m.created_ts,
+                        m.importance,
+                        m.thread_id,
+                        m.ack_required,
+                        mr.read_ts,
+                        mr.ack_ts
                     FROM messages m
                     JOIN message_recipients mr ON mr.message_id = m.id
                     JOIN agents a ON a.id = mr.agent_id
                     JOIN agents s ON s.id = m.sender_id
+                    LEFT JOIN projects sp ON sp.id = s.project_id
                     WHERE m.project_id = :pid AND a.name = :name
                     ORDER BY m.created_ts DESC
                     LIMIT :lim OFFSET :off
@@ -2174,17 +2736,34 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
                     ),
                     {"pid": pid, "name": agent, "lim": limit, "off": offset},
                 )
-                items = [
-                    {
-                        "id": r[0],
-                        "subject": r[1],
-                        "sender": r[2],
-                        "created": str(r[3]),
-                        "importance": r[4],
-                        "thread_id": r[5],
+                items = []
+                for r in inbox_rows.mappings().all():
+                    sender_display, sender_meta = _http_sender_identity(
+                        message_project_id=pid,
+                        sender_name=r["sender_name"],
+                        sender_project_id=r["sender_project_id"],
+                        sender_project_human_key=r["sender_project_name"],
+                        sender_project_slug=r["sender_project_slug"],
+                    )
+                    read_ts = r["read_ts"]
+                    ack_ts = r["ack_ts"]
+                    ack_required = bool(r["ack_required"])
+                    item = {
+                        "id": r["id"],
+                        "subject": r["subject"],
+                        "sender": sender_display,
+                        "created": str(r["created_ts"]),
+                        "importance": r["importance"],
+                        "thread_id": r["thread_id"],
+                        "ack_required": ack_required,
+                        "read_ts": str(read_ts) if read_ts else None,
+                        "ack_ts": str(ack_ts) if ack_ts else None,
+                        "unread": read_ts is None,
+                        "needs_ack": ack_required and ack_ts is None,
+                        "acked": ack_ts is not None,
                     }
-                    for r in inbox_rows.fetchall()
-                ]
+                    item.update(sender_meta)
+                    items.append(item)
             return await _render(
                 "mail_inbox.html",
                 project={"slug": prow[1], "human_key": prow[2]},
@@ -2212,38 +2791,102 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
                 mrow = (
                     await session.execute(
                         text(
-                            "SELECT m.id, m.subject, m.body_md, s.name, m.created_ts, m.importance, m.thread_id FROM messages m JOIN agents s ON s.id = m.sender_id WHERE m.project_id = :pid AND m.id = :mid"
+                            """
+                            SELECT
+                                m.id,
+                                m.subject,
+                                m.body_md,
+                                s.name AS sender_name,
+                                s.project_id AS sender_project_id,
+                                sp.human_key AS sender_project_name,
+                                sp.slug AS sender_project_slug,
+                                m.created_ts,
+                                m.importance,
+                                m.thread_id,
+                                m.ack_required,
+                                m.attachments
+                            FROM messages m
+                            JOIN agents s ON s.id = m.sender_id
+                            LEFT JOIN projects sp ON sp.id = s.project_id
+                            WHERE m.project_id = :pid AND m.id = :mid
+                            """
                         ),
                         {"pid": pid, "mid": mid},
                     )
-                ).fetchone()
+                ).mappings().fetchone()
                 if not mrow:
                     return await _render("error.html", message="Message not found")
                 recs = await session.execute(
                     text(
-                        "SELECT a.name, mr.kind FROM message_recipients mr JOIN agents a ON a.id = mr.agent_id WHERE mr.message_id = :mid"
+                        "SELECT a.name, mr.kind, mr.read_ts, mr.ack_ts "
+                        "FROM message_recipients mr JOIN agents a ON a.id = mr.agent_id "
+                        "WHERE mr.message_id = :mid"
                     ),
                     {"mid": mid},
                 )
-                recipients = [{"name": r[0], "kind": r[1]} for r in recs.fetchall()]
+                recipients = [
+                    {
+                        "name": r[0],
+                        "kind": r[1],
+                        "read_ts": str(r[2]) if r[2] else None,
+                        "ack_ts": str(r[3]) if r[3] else None,
+                    }
+                    for r in recs.fetchall()
+                ]
+                ack_required_msg = bool(mrow["ack_required"])
+                ack_count = sum(1 for r in recipients if r["ack_ts"])
+                read_count = sum(1 for r in recipients if r["read_ts"])
+                ack_summary = {
+                    "ack_required": ack_required_msg,
+                    "total": len(recipients),
+                    "read": read_count,
+                    "acked": ack_count,
+                }
                 # Find thread messages if thread_id is set
                 thread_items: list[dict] = []
-                th = mrow[6]
+                th = mrow["thread_id"]
                 if isinstance(th, str) and th.strip():
                     th_rows = await session.execute(
                         text(
-                            "SELECT m.id, m.subject, s.name, m.created_ts FROM messages m JOIN agents s ON s.id = m.sender_id WHERE m.project_id = :pid AND (m.thread_id = :th OR m.id = :id) ORDER BY m.created_ts ASC"
+                            """
+                            SELECT
+                                m.id,
+                                m.subject,
+                                s.name AS sender_name,
+                                s.project_id AS sender_project_id,
+                                sp.human_key AS sender_project_name,
+                                sp.slug AS sender_project_slug,
+                                m.created_ts
+                            FROM messages m
+                            JOIN agents s ON s.id = m.sender_id
+                            LEFT JOIN projects sp ON sp.id = s.project_id
+                            WHERE m.project_id = :pid AND (m.thread_id = :th OR m.id = :id)
+                            ORDER BY m.created_ts ASC
+                            """
                         ),
                         {"pid": pid, "th": th, "id": mid},
                     )
-                    thread_items = [
-                        {"id": rr[0], "subject": rr[1], "from": rr[2], "created": str(rr[3])}
-                        for rr in th_rows.fetchall()
-                    ]
+                    thread_items = []
+                    for rr in th_rows.mappings().all():
+                        sender_display, sender_meta = _http_sender_identity(
+                            message_project_id=pid,
+                            sender_name=rr["sender_name"],
+                            sender_project_id=rr["sender_project_id"],
+                            sender_project_human_key=rr["sender_project_name"],
+                            sender_project_slug=rr["sender_project_slug"],
+                        )
+                        item = {
+                            "id": rr["id"],
+                            "subject": rr["subject"],
+                            "from": sender_display,
+                            "created": str(rr["created_ts"]),
+                        }
+                        item.update(sender_meta)
+                        thread_items.append(item)
             # Convert markdown body to HTML for display (server-side render)
             body_html = (
-                markdown2.markdown(mrow[2] or "", extras=["fenced-code-blocks", "tables", "strike", "cuddled-lists"])
-                if mrow[2]
+                markdown2.markdown(mrow["body_md"] or "", extras=["fenced-code-blocks", "tables", "strike", "cuddled-lists"])
+                if mrow["body_md"]
                 else ""
             )
             if body_html:
@@ -2258,20 +2901,49 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
             except Exception:
                 pass  # Commit SHA is optional
 
+            sender_display, sender_meta = _http_sender_identity(
+                message_project_id=pid,
+                sender_name=mrow["sender_name"],
+                sender_project_id=mrow["sender_project_id"],
+                sender_project_human_key=mrow["sender_project_name"],
+                sender_project_slug=mrow["sender_project_slug"],
+            )
+            # Parse persisted attachments so the message view can render/link
+            # them (#220). Stored as a JSON array column.
+            message_attachments: list[dict[str, Any]] = []
+            try:
+                raw_attachments = mrow["attachments"]
+                if isinstance(raw_attachments, str):
+                    try:
+                        parsed_attachments = json.loads(raw_attachments)
+                    except json.JSONDecodeError:
+                        parsed_attachments = []
+                else:
+                    parsed_attachments = raw_attachments
+                if isinstance(parsed_attachments, list):
+                    message_attachments = [a for a in parsed_attachments if isinstance(a, dict)]
+            except Exception:
+                message_attachments = []
+
+            message_payload = {
+                "id": mrow["id"],
+                "subject": mrow["subject"],
+                "body_md": mrow["body_md"],
+                "body_html": body_html,
+                "sender": sender_display,
+                "created": str(mrow["created_ts"]),
+                "importance": mrow["importance"],
+                "thread_id": mrow["thread_id"],
+                "attachments": message_attachments,
+            }
+            message_payload.update(sender_meta)
+
             return await _render(
                 "mail_message.html",
                 project={"slug": prow[1], "human_key": prow[2]},
-                message={
-                    "id": mrow[0],
-                    "subject": mrow[1],
-                    "body_md": mrow[2],
-                    "body_html": body_html,
-                    "sender": mrow[3],
-                    "created": str(mrow[4]),
-                    "importance": mrow[5],
-                    "thread_id": mrow[6],
-                },
+                message=message_payload,
                 recipients=recipients,
+                ack_summary=ack_summary,
                 thread_items=thread_items,
                 commit_sha=commit_sha,
             )
@@ -2448,6 +3120,9 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
                         detail=f"Too many messages selected ({len(message_ids)}). Maximum is 500."
                     )
 
+                deleted_count = 0
+                messages_to_delete: list[tuple[Any, ...]] = []
+                recip_map: dict[int, list[str]] = {}
                 async with get_session() as session:
                     # Resolve project
                     prow = (
@@ -2489,7 +3164,7 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
                         ),
                         id_params,
                     )
-                    messages_to_delete = rows.fetchall()
+                    messages_to_delete = [tuple(row) for row in rows.fetchall()]
 
                     if not messages_to_delete:
                         return JSONResponse({"success": True, "deleted_count": 0})
@@ -2506,7 +3181,6 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
                         ),
                         {f"mid{i}": mid for i, mid in enumerate(message_ids)},
                     )
-                    recip_map: dict[int, list[str]] = {}
                     for rr in recip_rows.fetchall():
                         recip_map.setdefault(int(rr[0]), []).append(rr[1])
 
@@ -2524,108 +3198,28 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
                         id_params,
                     )
                     deleted_count = int(getattr(del_result, "rowcount", 0) or 0)
-
-                    # Delete markdown files from Git archive
-                    settings = get_settings()
-                    git_paths_removed: list[str] = []
-                    try:
-                        archive = await ensure_archive(settings, project_slug)
-                        import re as _re
-
-                        _SUBJECT_SLUG_RE = _re.compile(r"[^a-zA-Z0-9]+")
-
-                        for mrow in messages_to_delete:
-                            msg_id = int(mrow[0])
-                            created_ts_raw = mrow[1]
-                            subject_raw = str(mrow[2] or "")
-                            sender_name = str(mrow[3] or "")
-
-                            # Reconstruct the filename used by write_message_bundle
-                            try:
-                                if isinstance(created_ts_raw, str):
-                                    dt = datetime.fromisoformat(
-                                        created_ts_raw.replace("Z", "+00:00")
-                                        if created_ts_raw.endswith("Z")
-                                        else created_ts_raw
-                                    )
-                                else:
-                                    dt = created_ts_raw
-                                if dt.tzinfo is None:
-                                    dt = dt.replace(tzinfo=timezone.utc)
-                            except Exception:
-                                dt = datetime.now(timezone.utc)
-
-                            y_dir = dt.strftime("%Y")
-                            m_dir = dt.strftime("%m")
-                            created_iso = dt.astimezone(timezone.utc).strftime(
-                                "%Y-%m-%dT%H-%M-%SZ"
-                            )
-                            subject_slug = (
-                                _SUBJECT_SLUG_RE.sub("-", subject_raw)
-                                .strip("-_")
-                                .lower()[:80]
-                                or "message"
-                            )
-                            filename = f"{created_iso}__{subject_slug}__{msg_id}.md"
-
-                            # Paths: canonical, outbox, and each recipient inbox
-                            candidate_dirs = [
-                                archive.root / "messages" / y_dir / m_dir,
-                                archive.root / "agents" / sender_name / "outbox" / y_dir / m_dir,
-                            ]
-                            for recip_name in recip_map.get(msg_id, []):
-                                candidate_dirs.append(
-                                    archive.root / "agents" / recip_name / "inbox" / y_dir / m_dir
-                                )
-
-                            for cdir in candidate_dirs:
-                                fpath = cdir / filename
-                                if fpath.exists():
-                                    rel = fpath.relative_to(archive.repo_root).as_posix()
-                                    try:
-                                        fpath.unlink()
-                                        git_paths_removed.append(rel)
-                                    except OSError:
-                                        pass
-
-                        # Commit removals to Git
-                        if git_paths_removed:
-                            try:
-                                actor_module = importlib.import_module("git")
-                                actor_cls = getattr(actor_module, "Actor")
-                                git_actor = actor_cls(
-                                    settings.storage.git_author_name,
-                                    settings.storage.git_author_email,
-                                )
-                                archive.repo.index.remove(
-                                    git_paths_removed, working_tree=False
-                                )
-                                archive.repo.index.commit(
-                                    f"delete: {deleted_count} message(s) via web UI\n",
-                                    author=git_actor,
-                                    committer=git_actor,
-                                )
-                            except Exception as git_exc:
-                                # Log but don't fail the request if Git commit fails;
-                                # the files are already unlinked and DB rows deleted.
-                                import traceback
-
-                                traceback.print_exc()
-                                logging.getLogger(__name__).warning(
-                                    "Git commit for message deletion failed: %s", git_exc
-                                )
-                    except Exception as archive_exc:
-                        # Archive operations are best-effort; DB deletion already happened.
-                        logging.getLogger(__name__).warning(
-                            "Git archive cleanup failed: %s", archive_exc
-                        )
-
                     await session.commit()
+
+                settings = get_settings()
+                git_files_removed = 0
+                try:
+                    git_files_removed = await _delete_messages_from_archive(
+                        settings=settings,
+                        project_slug=project_slug,
+                        messages_to_delete=messages_to_delete,
+                        recip_map=recip_map,
+                        commit_message=f"delete: {deleted_count} message(s) via web UI\n",
+                    )
+                except Exception as archive_exc:
+                    # Archive operations are best-effort; DB deletion already happened.
+                    logging.getLogger(__name__).warning(
+                        "Git archive cleanup failed: %s", archive_exc
+                    )
 
                 return JSONResponse({
                     "success": True,
                     "deleted_count": deleted_count,
-                    "git_files_removed": len(git_paths_removed),
+                    "git_files_removed": git_files_removed,
                     "agent": agent,
                     "project": project_slug,
                 })
@@ -2668,9 +3262,20 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
                     rows = await session.execute(
                         text(
                             """
-                            SELECT m.id, m.subject, m.body_md, s.name, m.created_ts, m.importance, m.thread_id
+                            SELECT
+                                m.id,
+                                m.subject,
+                                m.body_md,
+                                s.name AS sender_name,
+                                s.project_id AS sender_project_id,
+                                sp.human_key AS sender_project_name,
+                                sp.slug AS sender_project_slug,
+                                m.created_ts,
+                                m.importance,
+                                m.thread_id
                             FROM messages m
                             JOIN agents s ON s.id = m.sender_id
+                            LEFT JOIN projects sp ON sp.id = s.project_id
                             WHERE m.project_id = :pid
                             AND (m.thread_id = :tid OR m.id = :tid_int)
                             ORDER BY m.created_ts ASC
@@ -2683,9 +3288,20 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
                     rows = await session.execute(
                         text(
                             """
-                            SELECT m.id, m.subject, m.body_md, s.name, m.created_ts, m.importance, m.thread_id
+                            SELECT
+                                m.id,
+                                m.subject,
+                                m.body_md,
+                                s.name AS sender_name,
+                                s.project_id AS sender_project_id,
+                                sp.human_key AS sender_project_name,
+                                sp.slug AS sender_project_slug,
+                                m.created_ts,
+                                m.importance,
+                                m.thread_id
                             FROM messages m
                             JOIN agents s ON s.id = m.sender_id
+                            LEFT JOIN projects sp ON sp.id = s.project_id
                             WHERE m.project_id = :pid
                             AND m.thread_id = :tid
                             ORDER BY m.created_ts ASC
@@ -2695,26 +3311,35 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
                     )
 
                 messages = []
-                for r in rows.fetchall():
+                for r in rows.mappings().all():
                     # Convert markdown to HTML for each message
                     body_html = ""
-                    if r[2]:  # body_md
+                    if r["body_md"]:
                         body_html = markdown2.markdown(
-                            r[2],
+                            r["body_md"],
                             extras=["fenced-code-blocks", "tables", "strike", "cuddled-lists"]
                         )
                         body_html = _html_cleaner.clean(body_html)
 
-                    messages.append({
-                        "id": r[0],
-                        "subject": r[1],
-                        "body_md": r[2],
+                    sender_display, sender_meta = _http_sender_identity(
+                        message_project_id=pid,
+                        sender_name=r["sender_name"],
+                        sender_project_id=r["sender_project_id"],
+                        sender_project_human_key=r["sender_project_name"],
+                        sender_project_slug=r["sender_project_slug"],
+                    )
+                    message = {
+                        "id": r["id"],
+                        "subject": r["subject"],
+                        "body_md": r["body_md"],
                         "body_html": body_html,
-                        "sender": r[3],
-                        "created": str(r[4]),
-                        "importance": r[5],
-                        "thread_id": r[6],
-                    })
+                        "sender": sender_display,
+                        "created": str(r["created_ts"]),
+                        "importance": r["importance"],
+                        "thread_id": r["thread_id"],
+                    }
+                    message.update(sender_meta)
+                    messages.append(message)
 
                 if not messages:
                     return await _render(
@@ -2744,6 +3369,9 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
             order: str | None = None,
             boost: int | None = None,
         ) -> HTMLResponse:
+            limit = min(max(1, limit), 10000)
+            if order not in ("relevance", "time", None):
+                order = "relevance"
             await ensure_schema()
             async with get_session() as session:
                 prow = (
@@ -2758,9 +3386,14 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
                 fts_expr, like_pat, like_scope, tokens = _parse_fts_query(q, scope)
                 weights = (0.0, 3.0, 1.0) if (boost or 0) else (0.0, 1.0, 1.0)
                 fts_sql = (
-                    "SELECT m.id, m.subject, s.name, m.created_ts, m.importance, m.thread_id, "
+                    "SELECT m.id, m.subject, s.name AS sender_name, s.project_id AS sender_project_id, "
+                    "sp.human_key AS sender_project_name, sp.slug AS sender_project_slug, "
+                    "m.created_ts, m.importance, m.thread_id, "
                     "snippet(fts_messages, 2, '<mark>', '</mark>', '…', 22) AS body_snippet "
-                    "FROM fts_messages JOIN messages m ON m.id = fts_messages.rowid JOIN agents s ON s.id = m.sender_id "
+                    "FROM fts_messages "
+                    "JOIN messages m ON m.id = fts_messages.rowid "
+                    "JOIN agents s ON s.id = m.sender_id "
+                    "LEFT JOIN projects sp ON sp.id = s.project_id "
                     "WHERE m.project_id = :pid AND fts_messages MATCH :q "
                     + (
                         "ORDER BY m.created_ts DESC "
@@ -2771,42 +3404,83 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
                 )
                 try:
                     rows = await session.execute(text(fts_sql), {"pid": pid, "q": fts_expr or q, "lim": limit})
-                    results = [
-                        {
-                            "id": r[0],
-                            "subject": r[1],
-                            "from": r[2],
-                            "created": str(r[3]),
-                            "importance": r[4],
-                            "thread_id": r[5],
-                            "snippet": r[6],
-                            "hits": (r[6] or "").count("<mark>"),
+                    results = []
+                    for r in rows.mappings().all():
+                        sender_display, sender_meta = _http_sender_identity(
+                            message_project_id=pid,
+                            sender_name=r["sender_name"],
+                            sender_project_id=r["sender_project_id"],
+                            sender_project_human_key=r["sender_project_name"],
+                            sender_project_slug=r["sender_project_slug"],
+                        )
+                        item = {
+                            "id": r["id"],
+                            "subject": r["subject"],
+                            "from": sender_display,
+                            "created": str(r["created_ts"]),
+                            "importance": r["importance"],
+                            "thread_id": r["thread_id"],
+                            "snippet": r["body_snippet"],
+                            "hits": (r["body_snippet"] or "").count("<mark>"),
                         }
-                        for r in rows.fetchall()
-                    ]
+                        item.update(sender_meta)
+                        results.append(item)
                 except Exception:
                     if like_scope == "subject":
-                        like_sql = "SELECT m.id, m.subject, s.name, m.created_ts, m.importance, m.thread_id FROM messages m JOIN agents s ON s.id = m.sender_id WHERE m.project_id = :pid AND m.subject LIKE :pat ESCAPE '\\' ORDER BY m.created_ts DESC LIMIT :lim"
+                        like_sql = (
+                            "SELECT m.id, m.subject, s.name AS sender_name, s.project_id AS sender_project_id, "
+                            "sp.human_key AS sender_project_name, sp.slug AS sender_project_slug, "
+                            "m.created_ts, m.importance, m.thread_id "
+                            "FROM messages m JOIN agents s ON s.id = m.sender_id "
+                            "LEFT JOIN projects sp ON sp.id = s.project_id "
+                            f"WHERE m.project_id = :pid AND m.subject LIKE :pat ESCAPE '{_LIKE_ESCAPE_CHAR}' "
+                            "ORDER BY m.created_ts DESC LIMIT :lim"
+                        )
                     elif like_scope == "body":
-                        like_sql = "SELECT m.id, m.subject, s.name, m.created_ts, m.importance, m.thread_id FROM messages m JOIN agents s ON s.id = m.sender_id WHERE m.project_id = :pid AND m.body_md LIKE :pat ESCAPE '\\' ORDER BY m.created_ts DESC LIMIT :lim"
+                        like_sql = (
+                            "SELECT m.id, m.subject, s.name AS sender_name, s.project_id AS sender_project_id, "
+                            "sp.human_key AS sender_project_name, sp.slug AS sender_project_slug, "
+                            "m.created_ts, m.importance, m.thread_id "
+                            "FROM messages m JOIN agents s ON s.id = m.sender_id "
+                            "LEFT JOIN projects sp ON sp.id = s.project_id "
+                            f"WHERE m.project_id = :pid AND m.body_md LIKE :pat ESCAPE '{_LIKE_ESCAPE_CHAR}' "
+                            "ORDER BY m.created_ts DESC LIMIT :lim"
+                        )
                     else:
-                        like_sql = "SELECT m.id, m.subject, s.name, m.created_ts, m.importance, m.thread_id FROM messages m JOIN agents s ON s.id = m.sender_id WHERE m.project_id = :pid AND (m.subject LIKE :pat ESCAPE '\\' OR m.body_md LIKE :pat ESCAPE '\\') ORDER BY m.created_ts DESC LIMIT :lim"
+                        like_sql = (
+                            "SELECT m.id, m.subject, s.name AS sender_name, s.project_id AS sender_project_id, "
+                            "sp.human_key AS sender_project_name, sp.slug AS sender_project_slug, "
+                            "m.created_ts, m.importance, m.thread_id "
+                            "FROM messages m JOIN agents s ON s.id = m.sender_id "
+                            "LEFT JOIN projects sp ON sp.id = s.project_id "
+                            f"WHERE m.project_id = :pid AND (m.subject LIKE :pat ESCAPE '{_LIKE_ESCAPE_CHAR}' "
+                            f"OR m.body_md LIKE :pat ESCAPE '{_LIKE_ESCAPE_CHAR}') "
+                            "ORDER BY m.created_ts DESC LIMIT :lim"
+                        )
                     rows = await session.execute(
-                        text(like_sql), {"pid": pid, "pat": like_pat or f"%{q}%", "lim": limit}
+                        text(like_sql), {"pid": pid, "pat": like_pat or f"%{_like_escape(q)}%", "lim": limit}
                     )
-                    results = [
-                        {
-                            "id": r[0],
-                            "subject": r[1],
-                            "from": r[2],
-                            "created": str(r[3]),
-                            "importance": r[4],
-                            "thread_id": r[5],
+                    results = []
+                    for r in rows.mappings().all():
+                        sender_display, sender_meta = _http_sender_identity(
+                            message_project_id=pid,
+                            sender_name=r["sender_name"],
+                            sender_project_id=r["sender_project_id"],
+                            sender_project_human_key=r["sender_project_name"],
+                            sender_project_slug=r["sender_project_slug"],
+                        )
+                        item = {
+                            "id": r["id"],
+                            "subject": r["subject"],
+                            "from": sender_display,
+                            "created": str(r["created_ts"]),
+                            "importance": r["importance"],
+                            "thread_id": r["thread_id"],
                             "snippet": "",
                             "hits": 0,
                         }
-                        for r in rows.fetchall()
-                    ]
+                        item.update(sender_meta)
+                        results.append(item)
             return await _render(
                 "mail_search.html",
                 project={"slug": prow[1], "human_key": prow[2]},
@@ -2832,16 +3506,22 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
                 if not prow:
                     return await _render("error.html", message="Project not found")
                 pid = int(prow[0])
+                # LEFT JOIN so orphaned reservations whose owning agent row
+                # has been deleted still surface in the web UI (`a.name` will
+                # be NULL — render as "<orphaned>" so operators see them and
+                # can act). Matches the model-side LEFT JOIN in
+                # _collect_file_reservation_statuses. (#161)
                 rows = await session.execute(
                     text(
-                        "SELECT c.id, a.name, c.path_pattern, c.exclusive, c.created_ts, c.expires_ts, c.released_ts FROM file_reservations c JOIN agents a ON a.id = c.agent_id WHERE c.project_id = :pid ORDER BY c.created_ts DESC"
+                        "SELECT c.id, a.name, c.path_pattern, c.exclusive, c.created_ts, c.expires_ts, c.released_ts, c.agent_id FROM file_reservations c LEFT JOIN agents a ON a.id = c.agent_id WHERE c.project_id = :pid ORDER BY c.created_ts DESC"
                     ),
                     {"pid": pid},
                 )
                 file_reservations = [
                     {
                         "id": r[0],
-                        "agent": r[1],
+                        "agent": r[1] if r[1] is not None else "<orphaned>",
+                        "agent_id": r[7],
                         "path_pattern": r[2],
                         "exclusive": bool(r[3]),
                         "created": str(r[4]),
@@ -2979,8 +3659,16 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
                         detail=f"Message body too long ({len(body_md)} characters). Maximum is {max_user_length} characters to accommodate the overseer preamble ({preamble_length} characters)."
                     )
 
-                # Single atomic transaction for all database operations
+                # Keep database work and archive work in separate phases so
+                # the request never holds a live DB transaction while doing
+                # archive/Git I/O.
                 from datetime import datetime, timezone
+                message_id: int | None = None
+                valid_recipients: list[str] = []
+                project_slug = ""
+                project_human_key = ""
+                overseer_name = "HumanOverseer"
+                now = datetime.now(timezone.utc).replace(tzinfo=None)
                 async with get_session() as session:
                     # Get project
                     prow = (
@@ -2998,7 +3686,6 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
                     project_human_key = prow[2]
 
                     # Get or create "HumanOverseer" agent (with race condition protection)
-                    overseer_name = "HumanOverseer"
                     overseer_row = (
                         await session.execute(
                             text("SELECT id, name FROM agents WHERE project_id = :pid AND name = :name"),
@@ -3045,8 +3732,6 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
                                 "ts": datetime.now(timezone.utc).replace(tzinfo=None),
                             },
                         )
-                        # Don't commit yet - wait until message is successfully created and written to Git
-
                         # Fetch the agent (whether we just created it or another request did)
                         overseer_row = (
                             await session.execute(
@@ -3060,10 +3745,6 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
 
                     # Extract overseer_id for later use
                     overseer_id = overseer_row[0]
-                    # Insert message into database
-                    message_id = None
-                    # Use naive UTC datetime for SQLite compatibility
-                    now = datetime.now(timezone.utc).replace(tzinfo=None)
 
                     result = await session.execute(
                         text("""
@@ -3127,30 +3808,36 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
                             detail=f"None of the specified recipients exist in this project. Available agents can be seen at /mail/{project_slug}"
                         )
 
-                    # Write to Git archive BEFORE committing to database (for transaction consistency)
-                    from .storage import ensure_archive, write_message_bundle
-                    settings = get_settings()
-                    archive = await ensure_archive(settings, project_slug)
+                    # Update HumanOverseer activity timestamp before commit.
+                    await session.execute(
+                        text("UPDATE agents SET last_active_ts = :ts WHERE id = :id"),
+                        {"ts": now, "id": overseer_id}
+                    )
 
-                    # Build message dict for Git
-                    message_dict = {
-                        "id": message_id,
-                        "thread_id": thread_id,
-                        "project": project_human_key,
-                        "project_slug": project_slug,
-                        "from": overseer_name,
-                        "to": valid_recipients,
-                        "cc": [],
-                        "bcc": [],
-                        "subject": subject,
-                        "importance": "high",
-                        "ack_required": False,
-                        "created": now.isoformat(),
-                        "attachments": []
-                    }
+                    await session.commit()
 
-                    try:
-                        # Write message bundle (canonical + outbox + inboxes) to Git
+                from .storage import ensure_archive, write_message_bundle
+
+                settings = get_settings()
+                archive = await ensure_archive(settings, project_slug)
+                message_dict = {
+                    "id": message_id,
+                    "thread_id": thread_id,
+                    "project": project_human_key,
+                    "project_slug": project_slug,
+                    "from": overseer_name,
+                    "to": valid_recipients,
+                    "cc": [],
+                    "bcc": [],
+                    "subject": subject,
+                    "importance": "high",
+                    "ack_required": False,
+                    "created": now.isoformat(),
+                    "attachments": [],
+                }
+
+                try:
+                    async with archive_write_lock(archive):
                         await write_message_bundle(
                             archive,
                             message_dict,
@@ -3158,24 +3845,14 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
                             overseer_name,
                             valid_recipients,
                             extra_paths=None,
-                            commit_text=f"Human Overseer message: {subject}"
+                            commit_text=f"Human Overseer message: {subject}",
+                            sender_outbox_name=overseer_name,
                         )
-                    except Exception as git_error:
-                        # Rollback database transaction if Git write fails
-                        await session.rollback()
-                        raise HTTPException(
-                            status_code=500,
-                            detail=f"Failed to write message to Git archive: {git_error!s}"
-                        ) from git_error
-
-                    # Update HumanOverseer activity timestamp (after successful Git write, before commit)
-                    await session.execute(
-                        text("UPDATE agents SET last_active_ts = :ts WHERE id = :id"),
-                        {"ts": now, "id": overseer_id}
-                    )
-
-                    # Commit all changes atomically: agent creation/update + message + recipients
-                    await session.commit()
+                except Exception as git_error:
+                    raise HTTPException(
+                        status_code=500,
+                        detail=f"Failed to write message to Git archive: {git_error!s}"
+                    ) from git_error
 
                 return JSONResponse({
                     "success": True,
@@ -3211,67 +3888,7 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
         async def archive_guide() -> HTMLResponse:
             """Display the archive access guide and overview."""
             settings = get_settings()
-            storage_root = str(Path(settings.storage.root).expanduser().resolve())
-
-            # Get basic stats
-            from pathlib import Path as P
-
-            from git import Repo as GitRepo
-
-            repo_root = P(storage_root)
-            if (repo_root / ".git").exists():
-                repo = None
-                try:
-                    repo = GitRepo(str(repo_root))
-                    # Use efficient commit counting with limit to prevent DoS
-                    commit_count = sum(1 for _ in repo.iter_commits(max_count=10000))
-                    total_commits = "10,000+" if commit_count == 10000 else f"{commit_count:,}"
-                    last_commit = next(repo.iter_commits(max_count=1), None)
-                    last_commit_time = last_commit.authored_datetime.strftime("%b %d, %Y") if last_commit else "Never"
-
-                    # Count projects (with limit for performance)
-                    projects_dir = repo_root / "projects"
-                    if projects_dir.exists():
-                        # Use islice to avoid loading all dirs into memory
-                        from itertools import islice
-
-                        project_count = sum(1 for p in islice(projects_dir.iterdir(), 100) if p.is_dir())
-                    else:
-                        project_count = 0
-
-                    # Estimate size with timeout (run blocking 'du' in a worker thread)
-                    import asyncio as _asyncio
-                    import subprocess as _subprocess
-                    try:
-                        def _run_du():
-                            return _subprocess.run(
-                                ["du", "-sh", str(repo_root)],
-                                capture_output=True,
-                                text=True,
-                                timeout=5.0,
-                            )
-
-                        result = await _asyncio.to_thread(_run_du)
-                        repo_size = result.stdout.split()[0] if getattr(result, "returncode", 1) == 0 else "Unknown"
-                    except (_subprocess.TimeoutExpired, FileNotFoundError, PermissionError, OSError):
-                        # du not available, took too long, or other OS error
-                        repo_size = "Unknown"
-                    except Exception:
-                        # Catch-all for unexpected errors
-                        repo_size = "Unknown"
-                except Exception:
-                    total_commits = "0"
-                    project_count = 0
-                    repo_size = "0 MB"
-                    last_commit_time = "Never"
-                finally:
-                    if repo is not None:
-                        repo.close()
-            else:
-                total_commits = "0"
-                project_count = 0
-                repo_size = "0 MB"
-                last_commit_time = "Never"
+            guide_stats = await asyncio.to_thread(_collect_archive_guide_stats_sync, settings)
 
             # Get list of projects for picker
             async with get_session() as session:
@@ -3280,11 +3897,11 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
 
             return await _render(
                 "archive_guide.html",
-                storage_root=storage_root,
-                total_commits=total_commits,
-                project_count=project_count,
-                repo_size=repo_size,
-                last_commit_time=last_commit_time,
+                storage_root=guide_stats["storage_root"],
+                total_commits=guide_stats["total_commits"],
+                project_count=guide_stats["project_count"],
+                repo_size=guide_stats["repo_size"],
+                last_commit_time=guide_stats["last_commit_time"],
                 projects=projects,
             )
 
@@ -3295,36 +3912,30 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
             limit = max(1, min(limit, 500))  # Between 1 and 500
 
             settings = get_settings()
-            repo_root = Path(settings.storage.root).expanduser().resolve()
-
-            from git import Repo as GitRepo
-
-            if not (repo_root / ".git").exists():
+            repo_root = await asyncio.to_thread(_expanduser_resolve_path, Path(settings.storage.root))
+            if not await asyncio.to_thread(_path_exists, repo_root / ".git"):
                 return await _render("archive_activity.html", commits=[])
 
             repo = None
             try:
-                repo = GitRepo(str(repo_root))
+                repo = await asyncio.to_thread(_open_git_repo, repo_root)
                 commits = await get_recent_commits(repo, limit=limit)
                 return await _render("archive_activity.html", commits=commits)
             finally:
                 if repo is not None:
-                    repo.close()
+                    await asyncio.to_thread(repo.close)
 
         @fastapi_app.get("/mail/archive/commit/{sha}", response_class=HTMLResponse)
         async def archive_commit(sha: str) -> HTMLResponse:
             """Display detailed commit information with diffs."""
             settings = get_settings()
-            repo_root = Path(settings.storage.root).expanduser().resolve()
-
-            from git import Repo as GitRepo
-
-            if not (repo_root / ".git").exists():
+            repo_root = await asyncio.to_thread(_expanduser_resolve_path, Path(settings.storage.root))
+            if not await asyncio.to_thread(_path_exists, repo_root / ".git"):
                 return await _render("error.html", message="Archive repository not found")
 
             repo = None
             try:
-                repo = GitRepo(str(repo_root))
+                repo = await asyncio.to_thread(_open_git_repo, repo_root)
                 commit = await get_commit_detail(repo, sha)
                 return await _render("archive_commit.html", commit=commit)
             except ValueError:
@@ -3335,7 +3946,7 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
                 return await _render("error.html", message="Commit not found")
             finally:
                 if repo is not None:
-                    repo.close()
+                    await asyncio.to_thread(repo.close)
 
         @fastapi_app.get("/mail/archive/timeline", response_class=HTMLResponse)
         async def archive_timeline(project: str | None = None) -> HTMLResponse:
@@ -3345,11 +3956,8 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
                 return await _render("error.html", message="Invalid project identifier")
 
             settings = get_settings()
-            repo_root = Path(settings.storage.root).expanduser().resolve()
-
-            from git import Repo as GitRepo
-
-            if not (repo_root / ".git").exists():
+            repo_root = await asyncio.to_thread(_expanduser_resolve_path, Path(settings.storage.root))
+            if not await asyncio.to_thread(_path_exists, repo_root / ".git"):
                 return await _render("error.html", message="Archive repository not found")
 
             # Default to first project if not specified
@@ -3374,12 +3982,12 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
 
             repo = None
             try:
-                repo = GitRepo(str(repo_root))
+                repo = await asyncio.to_thread(_open_git_repo, repo_root)
                 commits = await get_timeline_commits(repo, project, limit=100)
                 return await _render("archive_timeline.html", commits=commits, project=project, project_name=project_name)
             finally:
                 if repo is not None:
-                    repo.close()
+                    await asyncio.to_thread(repo.close)
 
         @fastapi_app.get("/mail/archive/browser", response_class=HTMLResponse)
         async def archive_browser(project: str | None = None, path: str = "") -> HTMLResponse:
@@ -3393,10 +4001,16 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
                 return await _render("error.html", message="Invalid project identifier")
 
             settings = get_settings()
-            archive = await ensure_archive(settings, project)
-            tree = await get_archive_tree(archive, path)
-
-            return await _render("archive_browser.html", tree=tree, project=project, path=path)
+            archive = await _open_existing_project_archive(settings, project)
+            if archive is None:
+                return await _render("error.html", message="Project archive not found")
+            try:
+                tree = await get_archive_tree(archive, path)
+                return await _render("archive_browser.html", tree=tree, project=project, path=path)
+            except ValueError:
+                return await _render("error.html", message="Invalid archive path")
+            finally:
+                await asyncio.to_thread(archive.repo.close)
 
         @fastapi_app.get("/mail/archive/browser/{project}/file")
         async def archive_browser_file(project: str, path: str) -> JSONResponse:
@@ -3407,8 +4021,13 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
 
             try:
                 settings = get_settings()
-                archive = await ensure_archive(settings, project)
-                content = await get_file_content(archive, path)
+                archive = await _open_existing_project_archive(settings, project)
+                if archive is None:
+                    raise HTTPException(status_code=404, detail="Project archive not found")
+                try:
+                    content = await get_file_content(archive, path)
+                finally:
+                    await asyncio.to_thread(archive.repo.close)
 
                 if content is None:
                     raise HTTPException(status_code=404, detail="File not found")
@@ -3417,6 +4036,45 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
             except ValueError as err:
                 # Path validation errors
                 raise HTTPException(status_code=400, detail="Invalid file path") from err
+            except HTTPException:
+                raise
+            except Exception as err:
+                raise HTTPException(status_code=404, detail="File not found") from err
+
+        @fastapi_app.get("/mail/archive/browser/{project}/download")
+        async def archive_browser_download(project: str, path: str) -> Response:
+            """Download a file from the archive as an attachment (#221)."""
+            # Validate project slug
+            if not _validate_project_slug(project):
+                raise HTTPException(status_code=400, detail="Invalid project identifier")
+
+            try:
+                settings = get_settings()
+                archive = await _open_existing_project_archive(settings, project)
+                if archive is None:
+                    raise HTTPException(status_code=404, detail="Project archive not found")
+                try:
+                    content = await get_file_content(archive, path)
+                finally:
+                    await asyncio.to_thread(archive.repo.close)
+
+                if content is None:
+                    raise HTTPException(status_code=404, detail="File not found")
+
+                # Derive a safe download filename from the (already validated)
+                # path's basename; strip any directory components and quotes.
+                filename = PurePosixPath(path.replace("\\", "/")).name or "download"
+                filename = filename.replace('"', "").replace("\r", "").replace("\n", "")
+                return Response(
+                    content=content,
+                    media_type="application/octet-stream",
+                    headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+                )
+            except ValueError as err:
+                # Path validation errors
+                raise HTTPException(status_code=400, detail="Invalid file path") from err
+            except HTTPException:
+                raise
             except Exception as err:
                 raise HTTPException(status_code=404, detail="File not found") from err
 
@@ -3428,11 +4086,8 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
                 return await _render("error.html", message="Invalid project identifier")
 
             settings = get_settings()
-            repo_root = Path(settings.storage.root).expanduser().resolve()
-
-            from git import Repo as GitRepo
-
-            if not (repo_root / ".git").exists():
+            repo_root = await asyncio.to_thread(_expanduser_resolve_path, Path(settings.storage.root))
+            if not await asyncio.to_thread(_path_exists, repo_root / ".git"):
                 return await _render("error.html", message="Archive repository not found")
 
             # Default to first project
@@ -3457,12 +4112,12 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
 
             repo = None
             try:
-                repo = GitRepo(str(repo_root))
+                repo = await asyncio.to_thread(_open_git_repo, repo_root)
                 graph = await get_agent_communication_graph(repo, project, limit=200)
                 return await _render("archive_network.html", graph=graph, project=project, project_name=project_name)
             finally:
                 if repo is not None:
-                    repo.close()
+                    await asyncio.to_thread(repo.close)
 
         @fastapi_app.get("/mail/api/projects/{project}/agents")
         async def api_project_agents(project: str) -> JSONResponse:
@@ -3518,12 +4173,22 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
             try:
                 # Get project archive
                 settings = get_settings()
-                repo = await ensure_archive(settings, project)
+                repo = await _open_existing_project_archive(settings, project)
+                if repo is None:
+                    return JSONResponse({
+                        "messages": [],
+                        "snapshot_time": None,
+                        "commit_sha": None,
+                        "requested_time": timestamp,
+                        "error": "Project archive not found",
+                    })
 
-                # Get historical snapshot
-                snapshot = await get_historical_inbox_snapshot(repo, agent, timestamp, limit=200)
-
-                return JSONResponse(snapshot)
+                try:
+                    # Get historical snapshot
+                    snapshot = await get_historical_inbox_snapshot(repo, agent, timestamp, limit=200)
+                    return JSONResponse(snapshot)
+                finally:
+                    await asyncio.to_thread(repo.repo.close)
 
             except Exception as e:
                 # Log error but return empty result rather than failing
@@ -3551,6 +4216,41 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
             structlog.get_logger("ui").error("ui_init_failed", error=str(exc))
         pass
 
+    # Keep the auto-generated /openapi.json focused on the real API contract.
+    # The browser-facing SSR mail UI (and its UI-backing JSON helpers) all live
+    # under the `/mail` prefix; they are registered for humans, not as part of
+    # the documented API surface, so we filter them out of the schema. The
+    # routes stay fully registered and functional — they are only omitted from
+    # the OpenAPI document. Using a custom app.openapi() (rather than
+    # include_in_schema=False on ~33 decorators) keeps this in one place and
+    # automatically covers any future /mail/* routes.
+    from fastapi.openapi.utils import get_openapi as _get_openapi
+
+    def _custom_openapi() -> dict[str, Any]:
+        if fastapi_app.openapi_schema:
+            return fastapi_app.openapi_schema
+        schema = _get_openapi(
+            title=fastapi_app.title,
+            version=fastapi_app.version,
+            openapi_version=fastapi_app.openapi_version,
+            description=fastapi_app.description,
+            routes=fastapi_app.routes,
+        )
+        paths = schema.get("paths")
+        if isinstance(paths, dict):
+            schema["paths"] = {
+                path: item
+                for path, item in paths.items()
+                if not (path == "/mail" or path.startswith("/mail/"))
+            }
+        fastapi_app.openapi_schema = schema
+        return schema
+
+    # Install the custom generator (FastAPI's documented extension point for
+    # overriding the OpenAPI document); cast keeps the bound-method override
+    # explicit for the type checker.
+    cast(Any, fastapi_app).openapi = _custom_openapi
+
     # Static web UI (SPA) routing support
     def _resolve_web_root() -> Path | None:
         candidates: list[Path] = []
@@ -3574,9 +4274,14 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
                 return True
             return path == base_no_slash or path.startswith(base_no_slash + "/")
 
+        def _should_spa_fallback(path: str) -> bool:
+            if _is_api_path(path):
+                return False
+            return not (path == "/mail" or path.startswith("/mail/"))
+
         @fastapi_app.exception_handler(HTTPException)
         async def spa_fallback(request: Request, exc: HTTPException):
-            if exc.status_code == status.HTTP_404_NOT_FOUND and not _is_api_path(request.url.path):
+            if exc.status_code == status.HTTP_404_NOT_FOUND and _should_spa_fallback(request.url.path):
                 return FileResponse(web_root / "index.html")
             return await http_exception_handler(request, exc)
 

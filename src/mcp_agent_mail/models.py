@@ -98,6 +98,10 @@ class Message(SQLModel, table=True):
     project_id: int = Field(foreign_key="projects.id", index=True)
     sender_id: int = Field(foreign_key="agents.id", index=True)
     thread_id: Optional[str] = Field(default=None, index=True, max_length=128)
+    # Direct parent→child reply edge (the specific message this one replies to),
+    # distinct from `thread_id` which groups a whole conversation. Nullable: a
+    # top-level message replies to nothing. (#188)
+    reply_to: Optional[int] = Field(default=None, foreign_key="messages.id", index=True)
     topic: Optional[str] = Field(default=None, max_length=64)
     subject: str = Field(max_length=512)
     body_md: str
@@ -119,7 +123,12 @@ class FileReservation(SQLModel, table=True):
 
     id: Optional[int] = Field(default=None, primary_key=True)
     project_id: int = Field(foreign_key="projects.id", index=True)
-    agent_id: int = Field(foreign_key="agents.id", index=True)
+    # Nullable so a reservation can outlive its owning agent — when the agent
+    # row is deleted (manual cleanup, project hygiene, etc.) the reservation
+    # becomes "orphaned" and must still be discoverable so it can be
+    # auto-released by the staleness sweeper instead of pinning the path
+    # forever. (#161)
+    agent_id: Optional[int] = Field(default=None, foreign_key="agents.id", index=True)
     path_pattern: str = Field(max_length=512)
     exclusive: bool = Field(default=True)
     reason: str = Field(default="", max_length=512)

@@ -28,8 +28,11 @@ import contextlib
 import pytest
 from fastmcp import Client
 from fastmcp.exceptions import ToolError
+from sqlmodel import select
 
 from mcp_agent_mail.app import build_mcp_server
+from mcp_agent_mail.db import get_session
+from mcp_agent_mail.models import Agent, Project
 
 # ============================================================================
 # Test: Invalid project_key
@@ -213,7 +216,13 @@ async def test_placeholder_detection_your_agent_name(isolated_env):
 
 @pytest.mark.asyncio
 async def test_send_message_empty_recipients(isolated_env):
-    """send_message with empty to/cc/bcc returns 0 deliveries (no error)."""
+    """send_message with empty to/cc/bcc (non-broadcast) must fail, not succeed with count:0.
+
+    Regression for #189: previously an all-empty recipient set fell through
+    and returned ``count: 0`` while reporting success, silently dropping the
+    message and contradicting the docstring ("If no recipients are given, the
+    call fails."). It must now raise INVALID_ARGUMENT.
+    """
     server = build_mcp_server()
     async with Client(server) as client:
         await client.call_tool("ensure_project", {"human_key": "/emptyrecip"})
@@ -223,20 +232,214 @@ async def test_send_message_empty_recipients(isolated_env):
         )
         sender_name = agent_result.data["name"]
 
-        # API allows empty recipients - returns 0 deliveries
+        # Non-broadcast send with no recipients must be rejected.
+        with pytest.raises(ToolError) as exc_info:
+            await client.call_tool(
+                "send_message",
+                {
+                    "project_key": "EmptyRecip",
+                    "sender_name": sender_name,
+                    "to": [],
+                    "subject": "Test",
+                    "body_md": "Body",
+                },
+            )
+        assert "recipient" in str(exc_info.value).lower()
+
+
+@pytest.mark.asyncio
+async def test_hard_delete_project_rejects_legacy_tokenless_project(isolated_env):
+    """Legacy projects with tokenless agents should not bypass hard-delete auth."""
+    server = build_mcp_server()
+    async with Client(server) as client:
+        await client.call_tool("ensure_project", {"human_key": "/legacy/no-token"})
+
+    async with get_session() as session:
+        project = (
+            await session.execute(select(Project).where(Project.human_key == "/legacy/no-token"))
+        ).scalars().one()
+        session.add(
+            Agent(
+                project_id=project.id,
+                name="BlueLake",
+                program="legacy",
+                model="legacy",
+                task_description="legacy bootstrap",
+            )
+        )
+        await session.commit()
+
+    async with Client(server) as client:
+        with pytest.raises(ToolError) as exc_info:
+            await client.call_tool(
+                "hard_delete_project",
+                {"project_key": "/legacy/no-token", "confirmation": "I UNDERSTAND"},
+            )
+        err = str(exc_info.value).lower()
+        assert "registration token" in err or "authenticated" in err
+
+
+@pytest.mark.asyncio
+async def test_hard_delete_project_removes_archive_tree(isolated_env, tmp_path):
+    server = build_mcp_server()
+    async with Client(server) as client:
+        project_result = await client.call_tool("ensure_project", {"human_key": "/deletable/project"})
+        project_payload = project_result.data.get("project") or project_result.data
+        slug = project_payload["slug"]
+        agent_result = await client.call_tool(
+            "register_agent",
+            {"project_key": "/deletable/project", "program": "test", "model": "test"},
+        )
+        registration_token = agent_result.data["registration_token"]
+
+        archive_file = tmp_path / "storage" / "projects" / slug / "messages" / "dummy.txt"
+        archive_file.parent.mkdir(parents=True, exist_ok=True)
+        archive_file.write_text("dummy archive content", encoding="utf-8")
+
         result = await client.call_tool(
-            "send_message",
+            "hard_delete_project",
             {
-                "project_key": "EmptyRecip",
-                "sender_name": sender_name,
-                "to": [],
-                "subject": "Test",
-                "body_md": "Body",
+                "project_key": "/deletable/project",
+                "confirmation": "I UNDERSTAND",
+                "registration_token": registration_token,
             },
         )
-        # Should succeed but with no deliveries
-        assert result.data["count"] == 0
-        assert result.data["deliveries"] == []
+
+    assert result.data["status"] == "hard_deleted"
+    assert result.data["deleted_counts"]["archive_files_removed"] >= 1
+    assert not (tmp_path / "storage" / "projects" / slug).exists()
+
+
+@pytest.mark.asyncio
+async def test_hard_delete_agent_removes_archive_tree(isolated_env, tmp_path):
+    server = build_mcp_server()
+    async with Client(server) as client:
+        project_result = await client.call_tool("ensure_project", {"human_key": "/deletable/agent"})
+        project_payload = project_result.data.get("project") or project_result.data
+        slug = project_payload["slug"]
+        agent_result = await client.call_tool(
+            "register_agent",
+            {"project_key": "/deletable/agent", "program": "test", "model": "test"},
+        )
+        agent_name = agent_result.data["name"]
+        registration_token = agent_result.data["registration_token"]
+
+        agent_archive_dir = tmp_path / "storage" / "projects" / slug / "agents" / agent_name
+        agent_archive_dir.mkdir(parents=True, exist_ok=True)
+        (agent_archive_dir / "dummy.txt").write_text("dummy archive content", encoding="utf-8")
+
+        result = await client.call_tool(
+            "hard_delete_agent",
+            {
+                "project_key": "/deletable/agent",
+                "agent_name": agent_name,
+                "confirmation": "I UNDERSTAND",
+                "registration_token": registration_token,
+            },
+        )
+
+    assert result.data["status"] == "hard_deleted"
+    assert result.data["deleted_counts"]["archive_files_removed"] >= 1
+    assert not agent_archive_dir.exists()
+
+
+@pytest.mark.asyncio
+async def test_hard_delete_agent_legacy_null_token_via_adjacent_agent(isolated_env):
+    """hard_delete_agent on a tokenless legacy agent must succeed when an
+    adjacent authenticated agent in the same project authorizes the call.
+
+    Regression for #147: without this path the only escape was direct SQL.
+    """
+    server = build_mcp_server()
+    async with Client(server) as client:
+        await client.call_tool("ensure_project", {"human_key": "/legacy/cleanup"})
+
+        # Create two agents in the project.
+        legacy_result = await client.call_tool(
+            "register_agent",
+            {"project_key": "/legacy/cleanup", "program": "legacy", "model": "legacy"},
+        )
+        legacy_name = legacy_result.data["name"]
+
+        peer_result = await client.call_tool(
+            "register_agent",
+            {"project_key": "/legacy/cleanup", "program": "peer", "model": "peer"},
+        )
+        peer_token = peer_result.data["registration_token"]
+
+        # Simulate legacy state: NULL-out the first agent's registration_token.
+        async with get_session() as session:
+            result_rows = await session.execute(
+                select(Agent).where(Agent.name == legacy_name)
+            )
+            legacy_agent = result_rows.scalars().one()
+            legacy_agent.registration_token = None
+            session.add(legacy_agent)
+            await session.commit()
+
+        # Bind the session to the peer agent (any authenticated call does this).
+        await client.call_tool(
+            "fetch_inbox",
+            {
+                "project_key": "/legacy/cleanup",
+                "agent_name": peer_result.data["name"],
+                "registration_token": peer_token,
+            },
+        )
+
+        # Now hard_delete the tokenless legacy agent — no token provided.
+        result = await client.call_tool(
+            "hard_delete_agent",
+            {
+                "project_key": "/legacy/cleanup",
+                "agent_name": legacy_name,
+                "confirmation": "I UNDERSTAND",
+            },
+        )
+        assert result.data["status"] == "hard_deleted"
+
+
+@pytest.mark.asyncio
+async def test_hard_delete_agent_null_token_without_peer_rejected(isolated_env):
+    """Tokenless target must still be rejected when no adjacent agent is
+    authenticated in the MCP session — the NULL-token bypass is not
+    a free-for-all.
+
+    We use two separate Client sessions: one to create the lone agent,
+    another (fresh, unauthenticated) to attempt the delete.
+    """
+    server = build_mcp_server()
+
+    # Session 1: create the agent.
+    async with Client(server) as setup_client:
+        await setup_client.call_tool("ensure_project", {"human_key": "/legacy/nopeer"})
+        lone_result = await setup_client.call_tool(
+            "register_agent",
+            {"project_key": "/legacy/nopeer", "program": "lone", "model": "lone"},
+        )
+        lone_name = lone_result.data["name"]
+
+    # Null out its token out-of-band.
+    async with get_session() as session:
+        result_rows = await session.execute(
+            select(Agent).where(Agent.name == lone_name)
+        )
+        lone = result_rows.scalars().one()
+        lone.registration_token = None
+        session.add(lone)
+        await session.commit()
+
+    # Session 2: fresh client, no session binding, no peer authenticated.
+    async with Client(server) as attack_client:
+        with pytest.raises(ToolError, match="does not have a registration token"):
+            await attack_client.call_tool(
+                "hard_delete_agent",
+                {
+                    "project_key": "/legacy/nopeer",
+                    "agent_name": lone_name,
+                    "confirmation": "I UNDERSTAND",
+                },
+            )
 
 
 @pytest.mark.asyncio
@@ -592,6 +795,76 @@ async def test_release_file_reservations_nonexistent_agent(isolated_env):
 
 
 @pytest.mark.asyncio
+async def test_release_file_reservations_rejects_empty_paths(isolated_env):
+    """release_file_reservations should reject an explicit empty paths filter."""
+    server = build_mcp_server()
+    async with Client(server) as client:
+        await client.call_tool("ensure_project", {"human_key": "/releaseemptypaths"})
+        agent_result = await client.call_tool(
+            "register_agent",
+            {"project_key": "ReleaseEmptyPaths", "program": "test", "model": "test"},
+        )
+        agent_name = agent_result.data["name"]
+
+        await client.call_tool(
+            "file_reservation_paths",
+            {
+                "project_key": "ReleaseEmptyPaths",
+                "agent_name": agent_name,
+                "paths": ["src/**"],
+                "ttl_seconds": 300,
+            },
+        )
+
+        with pytest.raises(ToolError) as excinfo:
+            await client.call_tool(
+                "release_file_reservations",
+                {
+                    "project_key": "ReleaseEmptyPaths",
+                    "agent_name": agent_name,
+                    "paths": [],
+                },
+            )
+
+        assert "empty" in str(excinfo.value).lower()
+
+
+@pytest.mark.asyncio
+async def test_release_file_reservations_rejects_empty_ids(isolated_env):
+    """release_file_reservations should reject an explicit empty id filter."""
+    server = build_mcp_server()
+    async with Client(server) as client:
+        await client.call_tool("ensure_project", {"human_key": "/releaseemptyids"})
+        agent_result = await client.call_tool(
+            "register_agent",
+            {"project_key": "ReleaseEmptyIds", "program": "test", "model": "test"},
+        )
+        agent_name = agent_result.data["name"]
+
+        await client.call_tool(
+            "file_reservation_paths",
+            {
+                "project_key": "ReleaseEmptyIds",
+                "agent_name": agent_name,
+                "paths": ["src/**"],
+                "ttl_seconds": 300,
+            },
+        )
+
+        with pytest.raises(ToolError) as excinfo:
+            await client.call_tool(
+                "release_file_reservations",
+                {
+                    "project_key": "ReleaseEmptyIds",
+                    "agent_name": agent_name,
+                    "file_reservation_ids": [],
+                },
+            )
+
+        assert "empty" in str(excinfo.value).lower()
+
+
+@pytest.mark.asyncio
 async def test_renew_file_reservations_nonexistent_agent(isolated_env):
     """renew_file_reservations should fail for non-existent agent."""
     server = build_mcp_server()
@@ -610,6 +883,76 @@ async def test_renew_file_reservations_nonexistent_agent(isolated_env):
         except ToolError as e:
             error_str = str(e).lower()
             assert "not found" in error_str or "agent" in error_str
+
+
+@pytest.mark.asyncio
+async def test_renew_file_reservations_rejects_empty_paths(isolated_env):
+    """renew_file_reservations should reject an explicit empty paths filter."""
+    server = build_mcp_server()
+    async with Client(server) as client:
+        await client.call_tool("ensure_project", {"human_key": "/renewemptypaths"})
+        agent_result = await client.call_tool(
+            "register_agent",
+            {"project_key": "RenewEmptyPaths", "program": "test", "model": "test"},
+        )
+        agent_name = agent_result.data["name"]
+
+        await client.call_tool(
+            "file_reservation_paths",
+            {
+                "project_key": "RenewEmptyPaths",
+                "agent_name": agent_name,
+                "paths": ["src/**"],
+                "ttl_seconds": 300,
+            },
+        )
+
+        with pytest.raises(ToolError) as excinfo:
+            await client.call_tool(
+                "renew_file_reservations",
+                {
+                    "project_key": "RenewEmptyPaths",
+                    "agent_name": agent_name,
+                    "paths": [],
+                },
+            )
+
+        assert "empty" in str(excinfo.value).lower()
+
+
+@pytest.mark.asyncio
+async def test_renew_file_reservations_rejects_empty_ids(isolated_env):
+    """renew_file_reservations should reject an explicit empty id filter."""
+    server = build_mcp_server()
+    async with Client(server) as client:
+        await client.call_tool("ensure_project", {"human_key": "/renewemptyids"})
+        agent_result = await client.call_tool(
+            "register_agent",
+            {"project_key": "RenewEmptyIds", "program": "test", "model": "test"},
+        )
+        agent_name = agent_result.data["name"]
+
+        await client.call_tool(
+            "file_reservation_paths",
+            {
+                "project_key": "RenewEmptyIds",
+                "agent_name": agent_name,
+                "paths": ["src/**"],
+                "ttl_seconds": 300,
+            },
+        )
+
+        with pytest.raises(ToolError) as excinfo:
+            await client.call_tool(
+                "renew_file_reservations",
+                {
+                    "project_key": "RenewEmptyIds",
+                    "agent_name": agent_name,
+                    "file_reservation_ids": [],
+                },
+            )
+
+        assert "empty" in str(excinfo.value).lower()
 
 
 # ============================================================================

@@ -69,6 +69,180 @@ require_cmd() {
   command -v "$cmd" >/dev/null 2>&1 || { log_err "Missing dependency: $cmd"; exit 1; }
 }
 
+# Read a single KEY=value line from a dotenv-shaped file. Last occurrence wins.
+# Strips leading whitespace, the literal `KEY=` prefix, one pair of surrounding
+# quotes (single or double), and any trailing CR (so CRLF dotenv files work).
+# Returns the unquoted value on stdout, exit 0 if found, exit 1 otherwise.
+_env_file_value() {
+  local file="$1"
+  local key="$2"
+  [[ -f "$file" ]] || return 1
+  local raw
+  raw=$(grep -E "^[[:space:]]*${key}=" "$file" 2>/dev/null | tail -n 1) || return 1
+  [[ -z "$raw" ]] && return 1
+  # Strip leading whitespace (tabs/spaces).
+  raw="${raw#${raw%%[![:space:]]*}}"
+  # Strip the `KEY=` prefix.
+  raw="${raw#${key}=}"
+  # Strip a trailing CR (CRLF source files) BEFORE quote stripping, otherwise
+  # the closing quote is no longer at the end of the string and we would leak
+  # the inner `"`.
+  raw="${raw%$'\r'}"
+  # Strip one matching pair of surrounding quotes (double or single). We
+  # require the open and close to be the same kind so we do not accidentally
+  # eat a single trailing quote out of a value like KEY=foo"bar.
+  if [[ ${#raw} -ge 2 && "${raw:0:1}" == '"' && "${raw: -1}" == '"' ]]; then
+    raw="${raw:1:${#raw}-2}"
+  elif [[ ${#raw} -ge 2 && "${raw:0:1}" == "'" && "${raw: -1}" == "'" ]]; then
+    raw="${raw:1:${#raw}-2}"
+  fi
+  printf '%s\n' "$raw"
+}
+
+# Resolve the active integration bearer token via a layered cascade.
+# Order (first non-empty wins):
+#   1. INTEGRATION_BEARER_TOKEN  (orchestrator-supplied session override)
+#   2. HTTP_BEARER_TOKEN          (already-running server env)
+#   3. MCP_AGENT_MAIL_TOKEN       (project-specific override)
+#   4. /run/credentials/mcp-agent-mail.service/agent-mail-token  (systemd LoadCredential)
+#   5. <root_dir>/.env            (project-local dotenv with HTTP_BEARER_TOKEN=)
+#   6. ${MCP_AGENT_MAIL_ENV_FILE} (operator-pinned env file)
+#   7. ${HOME}/.config/mcp-agent-mail/config.env  (user-default)
+#   8. legacy: scripts/run_server_with_token.sh  (older installs)
+# Always exits 0; emits empty line when nothing matched so callers can branch
+# on the result without distinguishing exit codes.
+resolve_integration_bearer_token() {
+  local root_dir="${1:-$PWD}"
+  root_dir="${root_dir%/}"
+  local cred_file="/run/credentials/mcp-agent-mail.service/agent-mail-token"
+  local token
+
+  for token in \
+    "${INTEGRATION_BEARER_TOKEN:-}" \
+    "${HTTP_BEARER_TOKEN:-}" \
+    "${MCP_AGENT_MAIL_TOKEN:-}"; do
+    if [[ -n "$token" ]]; then
+      printf '%s\n' "$token"
+      return 0
+    fi
+  done
+
+  if [[ -r "$cred_file" ]]; then
+    token=$(tr -d '\r\n' < "$cred_file" 2>/dev/null) || token=""
+    if [[ -n "$token" ]]; then
+      printf '%s\n' "$token"
+      return 0
+    fi
+  fi
+
+  local f
+  for f in \
+    "${root_dir}/.env" \
+    "${MCP_AGENT_MAIL_ENV_FILE:-}" \
+    "${HOME}/.config/mcp-agent-mail/config.env"; do
+    [[ -z "$f" ]] && continue
+    [[ -f "$f" ]] || continue
+    if token=$(_env_file_value "$f" "HTTP_BEARER_TOKEN") && [[ -n "$token" ]]; then
+      printf '%s\n' "$token"
+      return 0
+    fi
+  done
+
+  local legacy="${root_dir}/scripts/run_server_with_token.sh"
+  if [[ -f "$legacy" ]]; then
+    token=$(grep -E '^[[:space:]]*export[[:space:]]+HTTP_BEARER_TOKEN="' "$legacy" 2>/dev/null \
+      | tail -n 1 \
+      | sed -E 's/.*HTTP_BEARER_TOKEN="([^"]+)".*/\1/') || token=""
+    if [[ -n "$token" ]]; then
+      printf '%s\n' "$token"
+      return 0
+    fi
+  fi
+
+  printf '\n'
+  return 0
+}
+
+# Generate a fresh bearer token using whatever entropy source is available.
+# Probes: openssl > python3 > python > uv-run python > /dev/urandom > timestamp.
+# Output: 64 hex chars on every path except the last-resort timestamp fallback,
+# which emits "<unix-ns>_<hostname>" only when no real entropy source exists.
+#
+# Each candidate is captured into a local variable and length-validated before
+# being accepted. This prevents partial stdout from a failed candidate (e.g.
+# python printing diagnostic text to stdout before crashing) from leaking into
+# the result, and rejects short reads from /dev/urandom that occur in pre-seed
+# / restricted environments.
+generate_bearer_token() {
+  local token=""
+  if command -v openssl >/dev/null 2>&1; then
+    token=$(openssl rand -hex 32 2>/dev/null) || token=""
+    [[ ${#token} -eq 64 ]] || token=""
+  fi
+  if [[ -z "$token" ]] && command -v python3 >/dev/null 2>&1; then
+    token=$(python3 -c 'import secrets;print(secrets.token_hex(32))' 2>/dev/null) || token=""
+    [[ ${#token} -eq 64 ]] || token=""
+  fi
+  if [[ -z "$token" ]] && command -v python >/dev/null 2>&1; then
+    token=$(python -c 'import secrets;print(secrets.token_hex(32))' 2>/dev/null) || token=""
+    [[ ${#token} -eq 64 ]] || token=""
+  fi
+  if [[ -z "$token" ]] && command -v uv >/dev/null 2>&1; then
+    token=$(uv run --no-project python -c 'import secrets;print(secrets.token_hex(32))' 2>/dev/null) || token=""
+    [[ ${#token} -eq 64 ]] || token=""
+  fi
+  if [[ -z "$token" ]] && [[ -r /dev/urandom ]]; then
+    token=$(head -c 32 /dev/urandom 2>/dev/null | od -An -tx1 2>/dev/null | tr -d ' \n') || token=""
+    [[ ${#token} -eq 64 ]] || token=""
+  fi
+  if [[ -z "$token" ]]; then
+    token="$(date +%s%N 2>/dev/null || date +%s)_$(hostname 2>/dev/null || echo host)"
+  fi
+  printf '%s\n' "$token"
+}
+
+# Write the standard run-helper script at the given path. The helper resolves
+# HTTP_BEARER_TOKEN via the lib.sh cascade at runtime (preferred) or falls back
+# to its own minimal env-file resolution when lib.sh is missing.
+write_run_helper_script() {
+  local target="$1"
+  write_atomic "$target" <<'SH'
+#!/usr/bin/env bash
+set -euo pipefail
+
+ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+if [[ -f "${ROOT_DIR}/scripts/lib.sh" ]]; then
+  # shellcheck disable=SC1090
+  . "${ROOT_DIR}/scripts/lib.sh"
+fi
+
+if [[ -z "${HTTP_BEARER_TOKEN:-}" ]] && declare -F resolve_integration_bearer_token >/dev/null 2>&1; then
+  HTTP_BEARER_TOKEN="$(resolve_integration_bearer_token "${ROOT_DIR}")"
+fi
+if [[ -z "${HTTP_BEARER_TOKEN:-}" ]]; then
+  if [[ -f "${ROOT_DIR}/.env" ]]; then
+    HTTP_BEARER_TOKEN=$(grep -E '^HTTP_BEARER_TOKEN=' "${ROOT_DIR}/.env" 2>/dev/null | tail -n 1 | sed -E 's/^HTTP_BEARER_TOKEN=//') || true
+  fi
+fi
+if [[ -z "${HTTP_BEARER_TOKEN:-}" ]] && declare -F generate_bearer_token >/dev/null 2>&1; then
+  HTTP_BEARER_TOKEN="$(generate_bearer_token)"
+fi
+if [[ -z "${HTTP_BEARER_TOKEN:-}" ]]; then
+  if command -v openssl >/dev/null 2>&1; then
+    HTTP_BEARER_TOKEN="$(openssl rand -hex 32)"
+  elif command -v uv >/dev/null 2>&1; then
+    HTTP_BEARER_TOKEN="$(uv run python -c 'import secrets;print(secrets.token_hex(32))')"
+  else
+    HTTP_BEARER_TOKEN="$(date +%s)_$(hostname 2>/dev/null || echo host)"
+  fi
+fi
+export HTTP_BEARER_TOKEN
+
+uv run python -m mcp_agent_mail.cli serve-http "$@"
+SH
+  set_secure_exec "$target" || true
+}
+
 # Atomic write: read content from stdin and atomically move to target
 write_atomic() {
   local target="$1"; shift || true
@@ -181,6 +355,63 @@ json_merge_mcp_server() {
 
   echo "$existing" | jq --arg name "$server_name" --argjson config "$server_config" \
     '.mcpServers = (.mcpServers // {}) | .mcpServers[$name] = $config'
+}
+
+# Return the Morph grep-only tool allowlist unless explicitly overridden.
+default_morph_enabled_tools() {
+  printf '%s\n' "${MORPH_ENABLED_TOOLS:-warpgrep_codebase_search,warpgrep_github_search}"
+}
+
+# Best-effort Morph API key discovery for CLI installers.
+# Priority:
+#   1) MORPH_API_KEY env var
+#   2) ~/.codex/config.toml
+#   3) ~/.gemini/settings.json
+#   4) ~/.claude/settings.json
+#   5) legacy ~/.claude.json
+resolve_morph_api_key() {
+  local key=""
+
+  if [[ -n "${MORPH_API_KEY:-}" ]]; then
+    printf '%s\n' "${MORPH_API_KEY}"
+    return 0
+  fi
+
+  if [[ -f "${HOME}/.codex/config.toml" ]]; then
+    key=$(sed -n 's/^MORPH_API_KEY = "\(.*\)"$/\1/p' "${HOME}/.codex/config.toml" | head -n 1)
+    if [[ -n "${key}" ]]; then
+      printf '%s\n' "${key}"
+      return 0
+    fi
+  fi
+
+  if command -v jq >/dev/null 2>&1; then
+    if [[ -f "${HOME}/.gemini/settings.json" ]]; then
+      key=$(jq -r '.mcpServers["morph-mcp"].env.MORPH_API_KEY // empty' "${HOME}/.gemini/settings.json" 2>/dev/null || true)
+      if [[ -n "${key}" ]]; then
+        printf '%s\n' "${key}"
+        return 0
+      fi
+    fi
+
+    if [[ -f "${HOME}/.claude/settings.json" ]]; then
+      key=$(jq -r '.mcpServers["morph-mcp"].env.MORPH_API_KEY // empty' "${HOME}/.claude/settings.json" 2>/dev/null || true)
+      if [[ -n "${key}" ]]; then
+        printf '%s\n' "${key}"
+        return 0
+      fi
+    fi
+
+    if [[ -f "${HOME}/.claude.json" ]]; then
+      key=$(jq -r '.mcpServers["morph-mcp"].env.MORPH_API_KEY // empty' "${HOME}/.claude.json" 2>/dev/null || true)
+      if [[ -n "${key}" ]]; then
+        printf '%s\n' "${key}"
+        return 0
+      fi
+    fi
+  fi
+
+  printf '\n'
 }
 
 # Append hook to existing hooks array without duplicating
@@ -650,4 +881,89 @@ kill_port_processes() {
   fi
 }
 
+# ---------------------------------------------------------------------------
+# Explicit identity helpers (#140)
+# ---------------------------------------------------------------------------
+
+# Return the caller-requested agent name override, if set.
+# Agents can export AGENT_NAME=alpha-one before bootstrapping to claim
+# a stable identity across relaunches.
+requested_agent_name_override() {
+  local name="${AGENT_NAME:-}"
+  if [[ -z "$name" ]]; then
+    echo ""
+    return
+  fi
+  # Validate against the safe-ID pattern (mirrors _THREAD_ID_RE in utils.py)
+  if [[ "$name" =~ ^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$ ]]; then
+    echo "$name"
+  else
+    log_warn "AGENT_NAME='$name' does not match safe-ID pattern; ignoring"
+    echo ""
+  fi
+}
+
+# Build the JSON arguments fragment for register_agent, optionally including
+# an explicit name when AGENT_NAME is set.
+# Usage: _ARGS=$(build_register_agent_arguments_json "$human_key" "program" "model" "task" "$name_override")
+build_register_agent_arguments_json() {
+  local human_key="$1" program="$2" model="$3" task="$4" agent_name="${5:-}"
+  local program_esc model_esc task_esc
+  program_esc=$(json_escape_string "$program") || return 1
+  model_esc=$(json_escape_string "$model") || return 1
+  task_esc=$(json_escape_string "$task") || return 1
+  local args="\"project_key\":${human_key},\"program\":${program_esc},\"model\":${model_esc},\"task_description\":${task_esc}"
+  if [[ -n "$agent_name" ]]; then
+    local name_esc
+    name_esc=$(json_escape_string "$agent_name") || return 1
+    args="${args},\"name\":${name_esc}"
+  fi
+  echo "$args"
+}
+
+# Extract the registered agent name from a JSON-RPC response.
+extract_registered_agent_name() {
+  local response="$1"
+  if [[ -z "$response" ]]; then
+    echo ""
+    return
+  fi
+  local name=""
+  if command -v jq >/dev/null 2>&1; then
+    name=$(echo "$response" | jq -r '.result.content[0].text // empty' 2>/dev/null | jq -r '.name // empty' 2>/dev/null || echo "")
+  else
+    name=$(echo "$response" | uv run python -c 'import sys,json; r=json.load(sys.stdin); c=r.get("result",{}).get("content",[]); print(json.loads(c[0]["text"])["name"] if c else "")' 2>/dev/null || echo "")
+  fi
+  echo "$name"
+}
+
+# Extract the per-agent registration_token from a register_agent JSON-RPC response.
+#
+# Hook scripts (e.g. scripts/hooks/check_inbox.sh) invoke fetch_inbox via direct
+# curl POSTs that bypass any persistent MCP-session state, so the principal
+# bearer token alone is insufficient — the server requires the per-agent
+# registration_token in the JSON-RPC arguments. This helper lets installers
+# capture the token at registration time and propagate it into the hook env.
+extract_registered_registration_token() {
+  local response="$1"
+  if [[ -z "$response" ]]; then
+    echo ""
+    return
+  fi
+  local token=""
+  if command -v jq >/dev/null 2>&1; then
+    token=$(echo "$response" | jq -r '.result.content[0].text // empty' 2>/dev/null | jq -r '.registration_token // empty' 2>/dev/null || echo "")
+  else
+    token=$(echo "$response" | uv run python -c 'import sys,json; r=json.load(sys.stdin); c=r.get("result",{}).get("content",[]); print(json.loads(c[0]["text"]).get("registration_token","") if c else "")' 2>/dev/null || echo "")
+  fi
+  echo "$token"
+}
+
+# Write the agent identity to a discoverable file so shell tooling can find it.
+persist_agent_identity_file() {
+  local root_dir="$1" agent_name="$2" target_dir="${3:-$1}"
+  local identity_dir="${target_dir}/.agent-mail"
+  mkdir -p "$identity_dir" 2>/dev/null || true
+  echo "$agent_name" > "${identity_dir}/identity"
+}
 

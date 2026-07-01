@@ -62,11 +62,14 @@ def _render_chain_runner_script(hook_name: str) -> str:
         "            pass",
         "    return items",
         "",
+        "# Forward Git's hook arguments (e.g. pre-push <remote> <url>) to children.",
+        "ARGV = sys.argv[1:]",
+        "",
         "def _run_child(path: Path, * , stdin_bytes=None):",
         "    # On Windows, prefer 'python' for .py plugins to avoid PATHEXT reliance.",
         "    if os.name != 'posix' and path.suffix.lower() == '.py':",
-        "        return subprocess.run(['python', str(path)], input=stdin_bytes, check=False).returncode",
-        "    return subprocess.run([str(path)], input=stdin_bytes, check=False).returncode",
+        "        return subprocess.run(['python', str(path), *ARGV], input=stdin_bytes, check=False).returncode",
+        "    return subprocess.run([str(path), *ARGV], input=stdin_bytes, check=False).returncode",
         "",
     ]
     if hook_name == "pre-push":
@@ -78,7 +81,8 @@ def _render_chain_runner_script(hook_name: str) -> str:
             "    if rc != 0:",
             "        sys.exit(rc)",
             "",
-            "if ORIG.exists():",
+            "# Run the preserved original hook last (POSIX: only if it is executable).",
+            "if ORIG.exists() and (os.name != 'posix' or _is_exec(ORIG)):",
             "    rc = _run_child(ORIG, stdin_bytes=stdin_bytes)",
             "    if rc != 0:",
             "        sys.exit(rc)",
@@ -91,7 +95,8 @@ def _render_chain_runner_script(hook_name: str) -> str:
             "    if rc != 0:",
             "        sys.exit(rc)",
             "",
-            "if ORIG.exists():",
+            "# Run the preserved original hook last (POSIX: only if it is executable).",
+            "if ORIG.exists() and (os.name != 'posix' or _is_exec(ORIG)):",
             "    rc = _run_child(ORIG)",
             "    if rc != 0:",
             "        sys.exit(rc)",
@@ -161,10 +166,14 @@ def render_precommit_script(archive: ProjectArchive) -> str:
         f"STORAGE_ROOT = Path({json.dumps(storage_root)})",
         "",
         "# Gate variables (presence) and mode",
-        "GATE = (os.environ.get(\"WORKTREES_ENABLED\",\"0\") or os.environ.get(\"GIT_IDENTITY_ENABLED\",\"0\") or \"0\")",
+        "TRUTHY = {\"1\",\"true\",\"t\",\"yes\",\"y\"}",
+        "GATE_ENABLED = (",
+        "    os.environ.get(\"WORKTREES_ENABLED\", \"0\").strip().lower() in TRUTHY",
+        "    or os.environ.get(\"GIT_IDENTITY_ENABLED\", \"0\").strip().lower() in TRUTHY",
+        ")",
         "",
         "# Exit early if gate is not enabled (WORKTREES_ENABLED=0 and GIT_IDENTITY_ENABLED=0)",
-        "if GATE.strip().lower() not in {\"1\",\"true\",\"t\",\"yes\",\"y\"}:",
+        "if not GATE_ENABLED:",
         "    sys.exit(0)",
         "",
         "# Advisory/blocking mode: default to 'block' unless explicitly set to 'warn'.",
@@ -234,8 +243,19 @@ def render_precommit_script(archive: ProjectArchive) -> str:
         "    if parsed is None:",
         "        return True",
         "    return parsed > _now_utc()",
+        "# Honor core.ignorecase: case-fold paths and patterns before matching (#194).",
+        "def _detect_ignorecase():",
+        "    try:",
+        "        cp = subprocess.run([\"git\",\"config\",\"--type=bool\",\"--get\",\"core.ignorecase\"],",
+        "                            check=False,capture_output=True,text=True)",
+        "        return cp.stdout.strip() == \"true\"",
+        "    except Exception:",
+        "        return False",
+        "IGNORECASE = _detect_ignorecase()",
+        "def _casefold(value):",
+        "    return value.lower() if IGNORECASE else value",
         "def _compile_one(patt):",
-        "    q = patt.replace(\"\\\\\",\"/\")",
+        "    q = _casefold(patt.replace(\"\\\\\",\"/\"))",
         "    if _PS:",
         "        try:",
         "            return _PS.from_lines(\"gitignore\", [q])",
@@ -273,16 +293,19 @@ def render_precommit_script(archive: ProjectArchive) -> str:
         "                continue",
         "            holder = (r.get('agent') or '').strip()",
         "            exclusive = r.get('exclusive', True)",
+        "            released = (r.get('released_ts') or '').strip()",
         "            expires = (r.get('expires_ts') or '').strip()",
         "            if not exclusive:",
         "                continue",
         "            if holder and holder == AGENT_NAME:",
         "                continue",
+        "            if released:",
+        "                continue",
         "            if not _not_expired(expires):",
         "                continue",
         "            # Pre-compile pattern ONCE (not per-path)",
         "            spec = _compile_one(patt)",
-        "            patt_norm = patt.replace('\\\\','/').lstrip('/')",
+        "            patt_norm = _casefold(patt.replace('\\\\','/').lstrip('/'))",
         "            compiled_patterns.append((spec, patt, patt_norm, holder))",
         "            all_pattern_strings.append(patt_norm)",
         "except Exception:",
@@ -301,7 +324,7 @@ def render_precommit_script(archive: ProjectArchive) -> str:
         "conflicts = []",
         "if compiled_patterns:",
         "    for p in paths:",
-        "        norm = p.replace('\\\\','/').lstrip('/')",
+        "        norm = _casefold(p.replace('\\\\','/').lstrip('/'))",
         "        # Fast-path: if union_spec exists and path doesn't match ANY pattern, skip",
         "        if union_spec is not None and not union_spec.match_file(norm):",
         "            continue",
@@ -348,10 +371,14 @@ def render_prepush_script(archive: ProjectArchive) -> str:
         f"FILE_RESERVATIONS_DIR = Path({json.dumps(file_reservations_dir)})",
         "",
         "# Gate variables (presence) and mode",
-        "GATE = (os.environ.get(\"WORKTREES_ENABLED\",\"0\") or os.environ.get(\"GIT_IDENTITY_ENABLED\",\"0\") or \"0\")",
+        "TRUTHY = {\"1\",\"true\",\"t\",\"yes\",\"y\"}",
+        "GATE_ENABLED = (",
+        "    os.environ.get(\"WORKTREES_ENABLED\", \"0\").strip().lower() in TRUTHY",
+        "    or os.environ.get(\"GIT_IDENTITY_ENABLED\", \"0\").strip().lower() in TRUTHY",
+        ")",
         "",
         "# Exit early if gate is not enabled (WORKTREES_ENABLED=0 and GIT_IDENTITY_ENABLED=0)",
-        "if GATE.strip().lower() not in {\"1\",\"true\",\"t\",\"yes\",\"y\"}:",
+        "if not GATE_ENABLED:",
         "    sys.exit(0)",
         "",
         "MODE = (os.environ.get(\"AGENT_MAIL_GUARD_MODE\",\"block\") or \"block\").strip().lower()",
@@ -411,7 +438,7 @@ def render_prepush_script(archive: ProjectArchive) -> str:
         "# changed already initialized above; add per-commit changed paths (capture renames)",
         "for c in commits:",
         "    try:",
-        "        cp = subprocess.run([\"git\",\"diff-tree\",\"-r\",\"--no-commit-id\",\"--name-status\",\"-M\",\"--no-ext-diff\",\"--diff-filter=ACMRDTU\",\"-z\",c],",
+        "        cp = subprocess.run([\"git\",\"diff-tree\",\"-r\",\"--root\",\"--no-commit-id\",\"--name-status\",\"-M\",\"--no-ext-diff\",\"--diff-filter=ACMRDTU\",\"-z\",c],",
         "                            check=True,capture_output=True)",
         "        data = cp.stdout.decode(\"utf-8\",\"ignore\")",
         "        parts = [p for p in data.split(\"\\x00\") if p]",
@@ -453,8 +480,19 @@ def render_prepush_script(archive: ProjectArchive) -> str:
         "    if parsed is None:",
         "        return True",
         "    return parsed > _now_utc()",
+        "# Honor core.ignorecase: case-fold paths and patterns before matching (#194).",
+        "def _detect_ignorecase():",
+        "    try:",
+        "        cp = subprocess.run([\"git\",\"config\",\"--type=bool\",\"--get\",\"core.ignorecase\"],",
+        "                            check=False,capture_output=True,text=True)",
+        "        return cp.stdout.strip() == \"true\"",
+        "    except Exception:",
+        "        return False",
+        "IGNORECASE = _detect_ignorecase()",
+        "def _casefold(value):",
+        "    return value.lower() if IGNORECASE else value",
         "def _compile_one(patt):",
-        "    q = patt.replace(\"\\\\\",\"/\")",
+        "    q = _casefold(patt.replace(\"\\\\\",\"/\"))",
         "    if _PS:",
         "        try:",
         "            return _PS.from_lines(\"gitignore\", [q])",
@@ -492,16 +530,19 @@ def render_prepush_script(archive: ProjectArchive) -> str:
         "                continue",
         "            holder = (r.get('agent') or '').strip()",
         "            exclusive = r.get('exclusive', True)",
+        "            released = (r.get('released_ts') or '').strip()",
         "            expires = (r.get('expires_ts') or '').strip()",
         "            if not exclusive:",
         "                continue",
         "            if holder and holder == AGENT_NAME:",
         "                continue",
+        "            if released:",
+        "                continue",
         "            if not _not_expired(expires):",
         "                continue",
         "            # Pre-compile pattern ONCE (not per-path)",
         "            spec = _compile_one(patt)",
-        "            patt_norm = patt.replace('\\\\','/').lstrip('/')",
+        "            patt_norm = _casefold(patt.replace('\\\\','/').lstrip('/'))",
         "            compiled_patterns.append((spec, patt, patt_norm, holder))",
         "            all_pattern_strings.append(patt_norm)",
         "except Exception:",
@@ -520,7 +561,7 @@ def render_prepush_script(archive: ProjectArchive) -> str:
         "conflicts = []",
         "if compiled_patterns:",
         "    for p in changed:",
-        "        norm = p.replace('\\\\','/').lstrip('/')",
+        "        norm = _casefold(p.replace('\\\\','/').lstrip('/'))",
         "        # Fast-path: if union_spec exists and path doesn't match ANY pattern, skip",
         "        if union_spec is not None and not union_spec.match_file(norm):",
         "            continue",
@@ -669,6 +710,21 @@ async def uninstall_guard(repo_path: Path) -> bool:
         # List all files, excluding our plugin
         return any(item.is_file() and item.name != "50-agent-mail.py" for item in run_dir.iterdir())
 
+    def _agent_mail_shims(hook_name: str) -> list[Path]:
+        shim_signatures = {
+            hooks_dir / f"{hook_name}.cmd": f'python "%DIR%{hook_name}" %*',
+            hooks_dir / f"{hook_name}.ps1": f"Join-Path $PSScriptRoot '{hook_name}'",
+        }
+        matches: list[Path] = []
+        for shim_path, signature in shim_signatures.items():
+            try:
+                content = shim_path.read_text("utf-8")
+            except Exception:
+                continue
+            if signature in content:
+                matches.append(shim_path)
+        return matches
+
     # Remove our hooks.d plugins if present
     for sub in ("pre-commit", "pre-push"):
         plugin = hooks_dir / "hooks.d" / sub / "50-agent-mail.py"
@@ -703,14 +759,20 @@ async def uninstall_guard(repo_path: Path) -> bool:
                     # No other plugins, but .orig exists - restore original hook
                     await asyncio.to_thread(hook_path.unlink)
                     await asyncio.to_thread(orig_path.replace, hook_path)
+                    for shim_path in await asyncio.to_thread(_agent_mail_shims, hook_name):
+                        await asyncio.to_thread(shim_path.unlink)
                     removed = True
                 else:
                     # No other plugins and no .orig - safe to remove chain-runner
                     await asyncio.to_thread(hook_path.unlink)
+                    for shim_path in await asyncio.to_thread(_agent_mail_shims, hook_name):
+                        await asyncio.to_thread(shim_path.unlink)
                     removed = True
             elif is_legacy_hook:
                 # Legacy single-file hook (not chain-runner) - safe to remove
                 await asyncio.to_thread(hook_path.unlink)
+                for shim_path in await asyncio.to_thread(_agent_mail_shims, hook_name):
+                    await asyncio.to_thread(shim_path.unlink)
                 removed = True
 
     return removed

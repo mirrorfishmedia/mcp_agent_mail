@@ -13,6 +13,7 @@ Reference: mcp_agent_mail-c2x
 from __future__ import annotations
 
 import asyncio
+import gc
 import os
 import time
 from pathlib import Path
@@ -23,8 +24,10 @@ from mcp_agent_mail.config import get_settings
 from mcp_agent_mail.storage import (
     AsyncFileLock,
     archive_write_lock,
+    collect_lock_status,
     ensure_archive,
     ensure_archive_root,
+    get_lock_telemetry,
     heal_archive_locks,
     write_agent_profile,
 )
@@ -334,6 +337,43 @@ class TestLockHealing:
         assert str(metadata_path) in result.get("metadata_removed", [])
 
     @pytest.mark.asyncio
+    async def test_heal_archive_locks_cleans_old_lock_without_metadata(self, isolated_env):
+        """heal_archive_locks safely reaps old no-metadata lock files."""
+        settings = get_settings()
+        storage_root = Path(settings.storage.root).expanduser().resolve()
+        storage_root.mkdir(parents=True, exist_ok=True)
+
+        lock_path = storage_root / ".archive.lock"
+        lock_path.touch()
+        stale_time = time.time() - 400
+        os.utime(lock_path, (stale_time, stale_time))
+
+        result = await heal_archive_locks(settings)
+
+        assert str(lock_path) in result.get("locks_removed", [])
+        assert not lock_path.exists()
+
+    def test_collect_lock_status_flags_old_lock_without_metadata(self, isolated_env):
+        """collect_lock_status marks old no-metadata archive locks as stale."""
+        settings = get_settings()
+        storage_root = Path(settings.storage.root).expanduser().resolve()
+        storage_root.mkdir(parents=True, exist_ok=True)
+
+        lock_path = storage_root / ".archive.lock"
+        lock_path.touch()
+        stale_time = time.time() - 400
+        os.utime(lock_path, (stale_time, stale_time))
+
+        payload = collect_lock_status(settings)
+        entry = next(item for item in payload["locks"] if item["path"] == str(lock_path))
+
+        assert entry["metadata_present"] is False
+        assert entry["owner_alive"] is None
+        assert entry["stale_suspected"] is True
+        assert payload["summary"]["metadata_missing"] == 1
+        assert payload["summary"]["stale"] == 1
+
+    @pytest.mark.asyncio
     async def test_heal_archive_locks_handles_missing_root(self, isolated_env, monkeypatch):
         """heal_archive_locks handles missing storage root gracefully."""
         settings = get_settings()
@@ -378,6 +418,16 @@ class TestLockHealing:
 class TestAsyncFileLock:
     """Tests for AsyncFileLock behavior."""
 
+    def test_file_lock_destructor_tolerates_shutdown_globals(self, tmp_path, monkeypatch):
+        """__del__ should not crash if module globals are gone during interpreter shutdown."""
+        from mcp_agent_mail import storage as storage_module
+
+        lock = AsyncFileLock(tmp_path / "shutdown.lock")
+        monkeypatch.setattr(storage_module, "_LOCK_INSTANCES_GUARD", None)
+        monkeypatch.setattr(storage_module, "_ACTIVE_LOCK_INSTANCES", None)
+
+        lock.__del__()
+
     @pytest.mark.asyncio
     async def test_file_lock_writes_metadata(self, isolated_env):
         """AsyncFileLock writes owner metadata."""
@@ -397,6 +447,48 @@ class TestAsyncFileLock:
             metadata = json.loads(metadata_path.read_text())
             assert "pid" in metadata
             assert metadata["pid"] == os.getpid()
+
+    def test_file_lock_does_not_delete_fresh_lock_without_metadata(self, tmp_path):
+        """A fresh lock without sidecar metadata is not stale yet."""
+        lock_path = tmp_path / "fresh.lock"
+        lock_path.touch()
+
+        lock = AsyncFileLock(lock_path, stale_timeout_seconds=1.0)
+
+        assert lock._cleanup_if_stale() is False
+        assert lock_path.exists()
+
+    def test_active_lock_registry_reclaims_released_locks(self, tmp_path):
+        """Regression for #244: the telemetry registry must not pin lock instances.
+
+        With a plain strong-ref dict, every AsyncFileLock's refcount stayed >= 1,
+        so __del__ never fired and `active_locks` grew without bound. With a
+        WeakValueDictionary the GC reclaims dropped locks and the count returns to
+        baseline.
+        """
+        gc.collect()
+        baseline = get_lock_telemetry()["active_locks"]
+
+        locks = [AsyncFileLock(tmp_path / f"reg{i}.lock") for i in range(50)]
+        assert get_lock_telemetry()["active_locks"] >= baseline + 50
+
+        del locks
+        gc.collect()
+        # All 50 had no other references, so they must be reclaimed; the registry
+        # drops back to (at most) the baseline rather than leaking the 50.
+        assert get_lock_telemetry()["active_locks"] <= baseline
+
+    def test_file_lock_cleans_old_lock_without_metadata(self, tmp_path):
+        """Age-based cleanup still removes old lock files without metadata."""
+        lock_path = tmp_path / "old.lock"
+        lock_path.touch()
+        stale_time = time.time() - 120
+        os.utime(lock_path, (stale_time, stale_time))
+
+        lock = AsyncFileLock(lock_path, stale_timeout_seconds=1.0)
+
+        assert lock._cleanup_if_stale() is True
+        assert not lock_path.exists()
 
     @pytest.mark.asyncio
     async def test_file_lock_detects_stale_lock(self, isolated_env):

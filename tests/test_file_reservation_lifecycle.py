@@ -26,6 +26,7 @@ Reference: mcp_agent_mail-aew
 from __future__ import annotations
 
 import asyncio
+from datetime import datetime, timedelta, timezone
 
 import pytest
 from fastmcp import Client
@@ -597,6 +598,54 @@ async def test_manual_release_before_ttl(isolated_env):
 
 
 @pytest.mark.asyncio
+async def test_release_expired_reservation_is_noop(isolated_env):
+    """Manual release should ignore reservations whose TTL already elapsed."""
+    server = build_mcp_server()
+    async with Client(server) as client:
+        project_key, agent_name = await setup_project_and_agent(
+            client, "/test/res/release_expired_noop"
+        )
+
+        result = await client.call_tool(
+            "file_reservation_paths",
+            {
+                "project_key": project_key,
+                "agent_name": agent_name,
+                "paths": ["expired/**"],
+                "ttl_seconds": 3600,
+                "exclusive": True,
+            },
+        )
+        reservation_id = result.data["granted"][0]["id"]
+
+        async with get_session() as session:
+            expired = (
+                (datetime.now(timezone.utc) - timedelta(minutes=10))
+                .replace(tzinfo=None)
+                .strftime("%Y-%m-%d %H:%M:%S.%f")
+            )
+            await session.execute(
+                text("UPDATE file_reservations SET expires_ts = :ts WHERE id = :id"),
+                {"ts": expired, "id": reservation_id},
+            )
+            await session.commit()
+
+        release_result = await client.call_tool(
+            "release_file_reservations",
+            {
+                "project_key": project_key,
+                "agent_name": agent_name,
+                "file_reservation_ids": [reservation_id],
+            },
+        )
+
+        assert release_result.data["released"] == 0
+        reservation = await get_file_reservation_from_db(reservation_id)
+        assert reservation is not None
+        assert reservation["released_ts"] is None
+
+
+@pytest.mark.asyncio
 async def test_release_specific_paths(isolated_env):
     """Release only specific path patterns."""
     server = build_mcp_server()
@@ -749,6 +798,72 @@ async def test_renew_specific_reservation_by_id(isolated_env):
         assert renew_result.data["renewed"] == 1
 
 
+@pytest.mark.asyncio
+async def test_renew_does_not_revive_expired_reservation_after_overlap_reacquired(isolated_env):
+    """Expired reservations must be re-acquired, not revived by renew."""
+    server = build_mcp_server()
+    async with Client(server) as client:
+        project_key = "/test/res/renew_expired"
+        await client.call_tool("ensure_project", {"human_key": project_key})
+
+        agent1_result = await client.call_tool(
+            "register_agent",
+            {"project_key": project_key, "program": "test", "model": "test", "name": "BlueLake"},
+        )
+        agent2_result = await client.call_tool(
+            "register_agent",
+            {"project_key": project_key, "program": "test", "model": "test", "name": "GreenHill"},
+        )
+        agent1_name = agent1_result.data["name"]
+        agent2_name = agent2_result.data["name"]
+
+        first = await client.call_tool(
+            "file_reservation_paths",
+            {
+                "project_key": project_key,
+                "agent_name": agent1_name,
+                "paths": ["src/**"],
+                "ttl_seconds": 1,
+                "exclusive": True,
+            },
+        )
+        first_id = first.data["granted"][0]["id"]
+
+        await asyncio.sleep(1.2)
+
+        second = await client.call_tool(
+            "file_reservation_paths",
+            {
+                "project_key": project_key,
+                "agent_name": agent2_name,
+                "paths": ["src/app.py"],
+                "ttl_seconds": 300,
+                "exclusive": True,
+            },
+        )
+        assert second.data["granted"]
+
+        renew_result = await client.call_tool(
+            "renew_file_reservations",
+            {
+                "project_key": project_key,
+                "agent_name": agent1_name,
+                "file_reservation_ids": [first_id],
+                "extend_seconds": 600,
+            },
+        )
+
+        assert renew_result.data["renewed"] == 0
+
+        first_record = await get_file_reservation_from_db(first_id)
+        assert first_record is not None
+        assert first_record["released_ts"] is not None
+
+        project_id = await get_project_id(project_key)
+        assert project_id is not None
+        assert await count_active_reservations(project_id) == 1
+
+
 # ============================================================================
 # Test: Force release
 # ============================================================================
@@ -867,6 +982,57 @@ async def test_same_agent_no_self_conflict(isolated_env):
         assert "granted" in result.data or result.data.get("conflicts", []) == []
 
 
+@pytest.mark.asyncio
+async def test_same_agent_rereserve_updates_existing_active_reservation(isolated_env):
+    """Re-reserving the same path should update the active reservation instead of duplicating it."""
+    server = build_mcp_server()
+    async with Client(server) as client:
+        project_key, agent_name = await setup_project_and_agent(
+            client, "/test/res/self_update"
+        )
+
+        first = await client.call_tool(
+            "file_reservation_paths",
+            {
+                "project_key": project_key,
+                "agent_name": agent_name,
+                "paths": ["self/**"],
+                "ttl_seconds": 300,
+                "exclusive": True,
+                "reason": "initial hold",
+            },
+        )
+        first_granted = first.data["granted"][0]
+        first_id = first_granted["id"]
+        first_expires = datetime.fromisoformat(first_granted["expires_ts"])
+
+        second = await client.call_tool(
+            "file_reservation_paths",
+            {
+                "project_key": project_key,
+                "agent_name": agent_name,
+                "paths": ["self/**"],
+                "ttl_seconds": 60,
+                "exclusive": False,
+            },
+        )
+        second_granted = second.data["granted"][0]
+
+        assert second_granted["id"] == first_id
+        assert second_granted["reason"] == "initial hold"
+        assert second_granted["exclusive"] is False
+        assert datetime.fromisoformat(second_granted["expires_ts"]) >= first_expires
+
+        project_id = await get_project_id(project_key)
+        assert project_id is not None
+        assert await count_active_reservations(project_id) == 1
+
+        reservation = await get_file_reservation_from_db(first_id)
+        assert reservation is not None
+        assert reservation["reason"] == "initial hold"
+        assert bool(reservation["exclusive"]) is False
+
+
 # ============================================================================
 # Test: Multiple paths in single reservation
 # ============================================================================
@@ -980,3 +1146,48 @@ async def test_ttl_minimum_enforced(isolated_env):
             # Expected error for TTL too short
             error_str = str(e).lower()
             assert "ttl" in error_str or "60" in error_str or "minimum" in error_str
+
+
+@pytest.mark.asyncio
+async def test_file_reservation_rolls_back_db_row_when_archive_write_fails(isolated_env, monkeypatch):
+    """#180: file_reservation_paths commits reservation rows before writing the
+    Git archive. A failed archive write must delete the just-created rows so we
+    never leave a committed reservation with no archive artifact — mirroring the
+    message-creation compensation."""
+    from fastmcp.exceptions import ToolError
+
+    import mcp_agent_mail.app as app_module
+
+    server = build_mcp_server()
+    async with Client(server) as client:
+        project_key, agent_name = await setup_project_and_agent(client, "/test/res/archive-fail")
+
+        async def _boom(*_args, **_kwargs):
+            raise RuntimeError("simulated reservation archive write failure")
+
+        monkeypatch.setattr(app_module, "write_file_reservation_records", _boom)
+
+        with pytest.raises(ToolError):
+            await client.call_tool(
+                "file_reservation_paths",
+                {
+                    "project_key": project_key,
+                    "agent_name": agent_name,
+                    "paths": ["src/**"],
+                    "ttl_seconds": 3600,
+                    "exclusive": True,
+                    "reason": "should be rolled back on archive failure",
+                },
+            )
+
+        project_id = await get_project_id(project_key)
+        assert project_id is not None
+        # No reservation row should survive the archive-write failure.
+        async with get_session() as session:
+            count = (
+                await session.execute(
+                    text("SELECT COUNT(*) FROM file_reservations WHERE project_id = :pid"),
+                    {"pid": project_id},
+                )
+            ).scalar() or 0
+        assert count == 0, "orphaned file_reservation row left after archive write failure (#180)"

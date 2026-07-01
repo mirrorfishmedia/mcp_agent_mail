@@ -50,25 +50,21 @@ fi
 _URL="http://${_HTTP_HOST}:${_HTTP_PORT}${_HTTP_PATH}"
 log_ok "Detected MCP HTTP endpoint: ${_URL}"
 
-# Determine or generate bearer token (prefer session token provided by orchestrator)
-# Reuse existing token if possible (INTEGRATION_BEARER_TOKEN > .env > run helper)
-_TOKEN="${INTEGRATION_BEARER_TOKEN:-}"
-if [[ -z "${_TOKEN}" && -f .env ]]; then
-  _TOKEN=$(grep -E '^HTTP_BEARER_TOKEN=' .env | sed -E 's/^HTTP_BEARER_TOKEN=//') || true
-fi
-if [[ -z "${_TOKEN}" && -f scripts/run_server_with_token.sh ]]; then
-  _TOKEN=$(grep -E 'export HTTP_BEARER_TOKEN="' scripts/run_server_with_token.sh | sed -E 's/.*HTTP_BEARER_TOKEN="([^"]+)".*/\1/') || true
-fi
+# Determine or generate bearer token via shared resolver
+# (INTEGRATION_BEARER_TOKEN > HTTP_BEARER_TOKEN > MCP_AGENT_MAIL_TOKEN >
+#  systemd LoadCredential > .env > MCP_AGENT_MAIL_ENV_FILE > user config > legacy run helper)
+_TOKEN="$(resolve_integration_bearer_token "${ROOT_DIR}")"
 if [[ -z "${_TOKEN}" ]]; then
-  if command -v openssl >/dev/null 2>&1; then
-    _TOKEN=$(openssl rand -hex 32)
-  else
-    _TOKEN=$(uv run python - <<'PY'
-import secrets; print(secrets.token_hex(32))
-PY
-)
-  fi
+  _TOKEN="$(generate_bearer_token)"
   log_ok "Generated bearer token."
+fi
+
+_MORPH_ENABLED_TOOLS=$(default_morph_enabled_tools)
+_MORPH_API_KEY=$(resolve_morph_api_key)
+if [[ -n "${_MORPH_API_KEY}" ]]; then
+  log_ok "Morph MCP will be configured in grep-only mode."
+else
+  log_warn "Morph API key not found; skipping morph-mcp setup."
 fi
 
 log_step "Preparing project-local .claude/settings.json"
@@ -131,23 +127,33 @@ if [[ ${_SERVER_AVAILABLE} -eq 1 ]]; then
     log_warn "Failed to ensure project"
   fi
 
-  # register_agent - DON'T pass a name, let server auto-generate adjective+noun name
-  # Capture response to extract the generated name
+  # register_agent — pass explicit identity from AGENT_NAME if set, otherwise auto-generate
+  _REQUESTED_AGENT=$(requested_agent_name_override)
+  if [[ -n "${_REQUESTED_AGENT}" ]]; then
+    log_ok "Requesting explicit agent identity: ${_REQUESTED_AGENT}"
+  fi
+  _REGISTER_ARGS=$(build_register_agent_arguments_json "${_HUMAN_KEY_ESCAPED}" "claude-code" "claude-sonnet" "setup" "${_REQUESTED_AGENT}") || {
+    log_err "Failed to build register_agent arguments"
+    exit 1
+  }
   _REGISTER_RESPONSE=$(curl -sS --connect-timeout 2 --max-time 5 --retry 0 -H "Content-Type: application/json" "${_AUTH_ARGS[@]}" \
-      -d "{\"jsonrpc\":\"2.0\",\"id\":\"2\",\"method\":\"tools/call\",\"params\":{\"name\":\"register_agent\",\"arguments\":{\"project_key\":${_HUMAN_KEY_ESCAPED},\"program\":\"claude-code\",\"model\":\"claude-sonnet\",\"task_description\":\"setup\"}}}" \
+      -d "{\"jsonrpc\":\"2.0\",\"id\":\"2\",\"method\":\"tools/call\",\"params\":{\"name\":\"register_agent\",\"arguments\":{${_REGISTER_ARGS}}}}" \
       "${_URL}" 2>/dev/null || echo "")
 
+  _REG_TOKEN=""
   if [[ -n "${_REGISTER_RESPONSE}" ]]; then
-    # Extract agent name from JSON response using jq or Python
-    if command -v jq >/dev/null 2>&1; then
-      _AGENT=$(echo "${_REGISTER_RESPONSE}" | jq -r '.result.content[0].text // empty' 2>/dev/null | jq -r '.name // empty' 2>/dev/null || echo "")
-    else
-      _AGENT=$(echo "${_REGISTER_RESPONSE}" | uv run python -c 'import sys,json; r=json.load(sys.stdin); c=r.get("result",{}).get("content",[]); print(json.loads(c[0]["text"])["name"] if c else "")' 2>/dev/null || echo "")
-    fi
+    _AGENT=$(extract_registered_agent_name "${_REGISTER_RESPONSE}")
+    _REG_TOKEN=$(extract_registered_registration_token "${_REGISTER_RESPONSE}")
     if [[ -n "${_AGENT}" ]]; then
       log_ok "Registered agent: ${_AGENT}"
+      persist_agent_identity_file "${ROOT_DIR}" "${_AGENT}" "${TARGET_DIR}"
     else
       log_warn "Could not parse agent name from response"
+    fi
+    if [[ -z "${_REG_TOKEN}" ]]; then
+      log_warn "Could not parse registration_token from register_agent response."
+      log_warn "The PostToolUse(Bash) inbox-check hook will silently no-op until this is set."
+      log_warn "Re-run this integrator after confirming the server returns 'registration_token' in register_agent."
     fi
   else
     log_warn "Failed to register agent"
@@ -164,8 +170,14 @@ fi
 
 log_step "Writing MCP server config and hooks (merge, not overwrite)"
 
-# Build the inbox check command with environment variables
-INBOX_CHECK_CMD="AGENT_MAIL_PROJECT='${TARGET_DIR}' AGENT_MAIL_AGENT='${_AGENT}' AGENT_MAIL_URL='${_URL}' AGENT_MAIL_TOKEN='${_TOKEN}' AGENT_MAIL_INTERVAL='120' '${INBOX_HOOK}'"
+# Build the inbox check command with environment variables.
+#
+# AGENT_MAIL_REGISTRATION_TOKEN is required for fetch_inbox to authenticate
+# from a PostToolUse hook (each hook fires its own curl POST and bypasses
+# any persistent MCP-session state). AGENT_MAIL_HOOK_FORMAT=json makes the
+# reminder land in the agent's next-turn system-reminder context — plain
+# stdout is shown to the human in the terminal but never reaches the agent.
+INBOX_CHECK_CMD="AGENT_MAIL_PROJECT='${TARGET_DIR}' AGENT_MAIL_AGENT='${_AGENT}' AGENT_MAIL_URL='${_URL}' AGENT_MAIL_TOKEN='${_TOKEN}' AGENT_MAIL_REGISTRATION_TOKEN='${_REG_TOKEN:-}' AGENT_MAIL_HOOK_FORMAT='json' AGENT_MAIL_INTERVAL='120' '${INBOX_HOOK}'"
 
 # ============================================================================
 # settings.json: HOOKS ONLY (no secrets, git-tracked)
@@ -257,6 +269,20 @@ MCPJSON
 
 # Merge MCP server into existing config (preserves other servers)
 MERGED_LOCAL=$(json_merge_mcp_server "$EXISTING_LOCAL" "mcp-agent-mail" "$MCP_SERVER_CONFIG")
+if [[ -n "${_MORPH_API_KEY}" ]]; then
+  MORPH_SERVER_CONFIG=$(cat <<MCPJSON
+{
+  "command": "npx",
+  "args": ["-y", "@morphllm/morphmcp"],
+  "env": {
+    "ENABLED_TOOLS": "${_MORPH_ENABLED_TOOLS}",
+    "MORPH_API_KEY": "${_MORPH_API_KEY}"
+  }
+}
+MCPJSON
+)
+  MERGED_LOCAL=$(json_merge_mcp_server "$MERGED_LOCAL" "morph-mcp" "$MORPH_SERVER_CONFIG")
+fi
 
 write_atomic "$LOCAL_SETTINGS_PATH" <<< "$MERGED_LOCAL"
 json_validate "$LOCAL_SETTINGS_PATH" || log_warn "Invalid JSON in ${LOCAL_SETTINGS_PATH}"
@@ -286,8 +312,22 @@ if command -v jq >/dev/null 2>&1; then
   trap 'rm -f "$TMP_MERGE" 2>/dev/null' EXIT INT TERM
 
   umask 077  # Bug 1 fix: secure permissions for temp file
-  if jq --arg url "${_URL}" --arg token "${_TOKEN}" \
-      '.mcpServers = (.mcpServers // {}) | .mcpServers["mcp-agent-mail"] = {"type":"http","url":$url,"headers":{"Authorization": ("Bearer " + $token)}}' \
+  if jq --arg url "${_URL}" \
+      --arg token "${_TOKEN}" \
+      --arg morph_key "${_MORPH_API_KEY}" \
+      --arg morph_enabled "${_MORPH_ENABLED_TOOLS}" \
+      '.mcpServers = (.mcpServers // {}) |
+       .mcpServers["mcp-agent-mail"] = {"type":"http","url":$url,"headers":{"Authorization": ("Bearer " + $token)}} |
+       (if $morph_key != "" then
+          .mcpServers["morph-mcp"] = {
+            "command": "npx",
+            "args": ["-y", "@morphllm/morphmcp"],
+            "env": {
+              "MORPH_API_KEY": $morph_key,
+              "ENABLED_TOOLS": $morph_enabled
+            }
+          }
+        else . end)' \
       "$HOME_SETTINGS_PATH" > "$TMP_MERGE"; then
     # Bug 3 fix: Check mv separately
     if mv "$TMP_MERGE" "$HOME_SETTINGS_PATH"; then
@@ -319,7 +359,18 @@ else
       "type": "http",
       "url": "${_URL}",
       "headers": {${AUTH_HEADER_LINE}}
+    }$(if [[ -n "${_MORPH_API_KEY}" ]]; then cat <<JSONFRAG
+,
+    "morph-mcp": {
+      "command": "npx",
+      "args": ["-y", "@morphllm/morphmcp"],
+      "env": {
+        "MORPH_API_KEY": "${_MORPH_API_KEY}",
+        "ENABLED_TOOLS": "${_MORPH_ENABLED_TOOLS}"
+      }
     }
+JSONFRAG
+fi)
   }
 }
 JSON
@@ -331,34 +382,11 @@ fi
 # Bug #5 fix: set_secure_file logs its own warning, no need to duplicate
 set_secure_file "$HOME_SETTINGS_PATH" || true
 
-# Create run helper script with token
+# Create run helper script (centralized in lib.sh)
 log_step "Creating run helper script"
 mkdir -p scripts
 RUN_HELPER="scripts/run_server_with_token.sh"
-write_atomic "$RUN_HELPER" <<'SH'
-#!/usr/bin/env bash
-set -euo pipefail
-
-if [[ -z "${HTTP_BEARER_TOKEN:-}" ]]; then
-  if [[ -f .env ]]; then
-    HTTP_BEARER_TOKEN=$(grep -E '^HTTP_BEARER_TOKEN=' .env | sed -E 's/^HTTP_BEARER_TOKEN=//') || true
-  fi
-fi
-if [[ -z "${HTTP_BEARER_TOKEN:-}" ]]; then
-  if command -v uv >/dev/null 2>&1; then
-    HTTP_BEARER_TOKEN=$(uv run python - <<'PY'
-import secrets; print(secrets.token_hex(32))
-PY
-)
-  else
-    HTTP_BEARER_TOKEN="$(date +%s)_$(hostname)"
-  fi
-fi
-export HTTP_BEARER_TOKEN
-
-uv run python -m mcp_agent_mail.cli serve-http "$@"
-SH
-set_secure_exec "$RUN_HELPER"
+write_run_helper_script "$RUN_HELPER"
 echo "Created $RUN_HELPER"
 
 # Register with Claude Code CLI at user and project scope for immediate discovery
@@ -378,4 +406,3 @@ _print "Open your project in Claude Code; it should auto-detect the project-leve
 if [[ ${_SERVER_AVAILABLE} -eq 0 ]]; then
   _print "Remember to start the server: uv run python -m mcp_agent_mail.cli serve-http"
 fi
-

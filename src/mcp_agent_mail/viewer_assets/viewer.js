@@ -888,7 +888,11 @@ function viewerController() {
           mv.body_length,
           mv.latest_snippet,
           mv.recipients,
-          mv.sender_name AS sender,
+          COALESCE(mv.sender_display, mv.sender_name) AS sender,
+          mv.sender_name,
+          mv.sender_project_slug,
+          mv.sender_project_name,
+          mv.sender_address,
           COALESCE(p.slug, 'unknown') AS project_slug,
           COALESCE(p.human_key, 'Unknown Project') AS project_name
         FROM message_overview_mv mv
@@ -987,12 +991,26 @@ function viewerController() {
       }
       if (tokens.length === 0) return new Set();
 
+      // 1b) Insert an implicit AND between adjacent operands so a bare
+      // multi-word query like `hello world` is treated as `hello AND world`
+      // (#222). Without this, the tokens produce a malformed RPN (multiple
+      // values left on the stack) and buildAst returns null → zero results.
+      const endsOperand = (t) => !!t && (t.kind === 'term' || t.kind === ')');
+      const startsOperand = (t) => !!t && (t.kind === 'term' || t.kind === '(' || (t.kind === 'op' && t.value === 'NOT'));
+      const expandedTokens = [];
+      for (let i = 0; i < tokens.length; i++) {
+        if (i > 0 && endsOperand(tokens[i - 1]) && startsOperand(tokens[i])) {
+          expandedTokens.push({ kind: 'op', value: 'AND' });
+        }
+        expandedTokens.push(tokens[i]);
+      }
+
       // 2) Shunting-yard → RPN with precedence: NOT(3) > AND(2) > OR(1)
       const prec = { NOT: 3, AND: 2, OR: 1 };
       const rightAssoc = { NOT: true };
       const output = [];
       const ops = [];
-      for (const t of tokens) {
+      for (const t of expandedTokens) {
         if (t.kind === 'term') {
           output.push(t);
         } else if (t.kind === 'op') {
@@ -1016,7 +1034,11 @@ function viewerController() {
       }
       while (ops.length > 0) output.push(ops.pop());
 
-      // 3) Build AST from RPN
+      // 3) Build AST from RPN.
+      // Returns null for malformed input (operators missing operands, or leftover
+      // operands), so callers treat it as a clean no-op rather than crashing on a
+      // stack underflow or an operator node with undefined children (e.g. a bare
+      // "NOT" or "a AND").
       function buildAst(rpn) {
         const stack = [];
         for (const t of rpn) {
@@ -1024,16 +1046,19 @@ function viewerController() {
             stack.push({ type: 'term', value: t.value });
           } else if (t.kind === 'op') {
             if (t.value === 'NOT') {
+              if (stack.length < 1) return null;
               const a = stack.pop();
               stack.push({ type: 'not', child: a });
             } else {
+              if (stack.length < 2) return null;
               const b = stack.pop();
               const a = stack.pop();
               stack.push({ type: t.value.toLowerCase(), left: a, right: b });
             }
           }
         }
-        return stack.pop() || null;
+        // A well-formed expression collapses to exactly one node.
+        return stack.length === 1 ? stack[0] : null;
       }
       const ast = buildAst(output);
       if (!ast) return new Set();
@@ -1081,6 +1106,7 @@ function viewerController() {
 
       // 5) LIKE fallback
       function buildLike(node, acc) {
+        if (!node) return;
         switch (node.type) {
           case 'term': {
             const needle = `%${String(node.value).toLowerCase()}%`;
@@ -1222,7 +1248,11 @@ function viewerController() {
           COALESCE(ov.latest_snippet, '') AS latest_snippet,
           COALESCE(ov.attachment_count, 0) AS attachment_count,
           COALESCE(ov.recipients, '') AS recipients,
-          COALESCE(a.name, 'Unknown') AS sender
+          COALESCE(ov.sender_display, a.name, 'Unknown') AS sender,
+          ov.sender_name,
+          ov.sender_project_slug,
+          ov.sender_project_name,
+          ov.sender_address
         FROM messages m
         LEFT JOIN agents a ON a.id = m.sender_id
         LEFT JOIN message_overview_mv ov ON ov.id = m.id
@@ -1462,23 +1492,6 @@ function viewerController() {
       if (this.selectedThread && !this.isThreadVisible(this.selectedThread)) {
         this.selectedThread = null;
       }
-
-      // Legacy compatibility: populate simple list for tests that look for #message-list li
-      try {
-        const compat = document.getElementById('message-list');
-        if (compat) {
-          compat.innerHTML = '';
-          const take = Math.min(10, this.filteredMessages.length);
-          for (let i = 0; i < take; i++) {
-            const msg = this.filteredMessages[i];
-            const li = document.createElement('li');
-            li.textContent = (msg && msg.subject) ? String(msg.subject) : '(no subject)';
-            compat.appendChild(li);
-          }
-        }
-      } catch (e) {
-        /* ignore */
-      }
     },
 
     clearFilters() {
@@ -1564,6 +1577,8 @@ function viewerController() {
         if (firstVisibleThread) {
           this.selectThread(firstVisibleThread);
         }
+      } catch (e) {
+        /* ignore */
       }
     },
 

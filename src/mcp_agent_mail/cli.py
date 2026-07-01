@@ -18,16 +18,18 @@ import time
 import warnings
 import webbrowser
 from contextlib import nullcontext, suppress
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 from datetime import datetime, timedelta, timezone
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Annotated, Any, Iterable, List, Optional, Sequence, cast
-from zipfile import ZIP_DEFLATED, ZipFile
+from zipfile import ZIP_DEFLATED, BadZipFile, ZipFile
 
+import click
 import httpx
 import typer
 import uvicorn
+from filelock import BaseFileLock, FileLock, Timeout as LockTimeout
 from rich.console import Console
 from rich.table import Table
 from sqlalchemy import (
@@ -43,12 +45,37 @@ from sqlalchemy import (
 from sqlalchemy.engine import make_url
 from sqlalchemy.sql import ColumnElement
 
-from .app import _sanitize_fts_query, build_mcp_server
-from .config import get_settings
-from .db import ensure_schema, get_session, reset_database_state
+from .app import (
+    _LIKE_ESCAPE_CHAR,
+    _canonicalize_project_identifier,
+    _extract_like_terms,
+    _like_escape,
+    _sanitize_fts_query,
+    _sender_display_name,
+    build_mcp_server,
+)
+from .config import clear_settings_cache, get_settings
+from .db import (
+    ensure_schema,
+    get_session,
+    get_sqlite_sidecar_paths,
+    reset_database_state,
+)
 from .guard import install_guard as install_guard_script, uninstall_guard as uninstall_guard_script
 from .http import build_http_app
-from .models import Agent, AgentLink, FileReservation, Message, MessageRecipient, MessageSummary, Product, ProductProjectLink, Project, ProjectSiblingSuggestion, WindowIdentity
+from .models import (
+    Agent,
+    AgentLink,
+    FileReservation,
+    Message,
+    MessageRecipient,
+    MessageSummary,
+    Product,
+    ProductProjectLink,
+    Project,
+    ProjectSiblingSuggestion,
+    WindowIdentity,
+)
 from .share import (
     DEFAULT_CHUNK_SIZE,
     DEFAULT_CHUNK_THRESHOLD,
@@ -67,7 +94,7 @@ from .share import (
     sign_manifest,
     summarize_snapshot,
 )
-from .storage import ensure_archive
+from .storage import archive_write_lock, ensure_archive
 from .utils import slugify
 
 # Suppress annoying bleach CSS sanitizer warning from dependencies
@@ -85,6 +112,213 @@ ARCHIVE_METADATA_FILENAME = "metadata.json"
 ARCHIVE_SNAPSHOT_RELATIVE = Path("snapshot") / "mailbox.sqlite3"
 ARCHIVE_STORAGE_DIRNAME = Path("storage_repo")
 DEFAULT_ARCHIVE_SCRUB_PRESET = "archive"
+
+
+def _cli_sender_display(
+    *,
+    message_project_id: int | None,
+    sender_name: str | None,
+    sender_project_id: int | None,
+    sender_project_slug: str | None,
+) -> str:
+    canonical_sender = (sender_name or "").strip()
+    if not canonical_sender:
+        return "Unknown"
+    return _sender_display_name(
+        message_project_id=message_project_id,
+        sender_name=canonical_sender,
+        sender_project_id=sender_project_id,
+        sender_project_slug=sender_project_slug,
+    )
+
+
+def _format_cli_timestamp(value: Any) -> str:
+    """Render timestamps compactly so important identity columns stay visible."""
+    dt = _parse_iso_datetime(value)
+    if dt is not None:
+        return dt.strftime("%Y-%m-%d %H:%M")
+    if hasattr(value, "strftime"):
+        with suppress(Exception):
+            return value.strftime("%Y-%m-%d %H:%M")
+    if hasattr(value, "isoformat"):
+        with suppress(Exception):
+            return value.isoformat()
+    return str(value or "")
+
+
+def _add_message_sender_column(table: Table) -> None:
+    """Keep sender addresses readable in narrow terminals."""
+    table.add_column("from", overflow="fold", min_width=15)
+
+
+def _add_message_timestamp_column(table: Table) -> None:
+    """Use a compact timestamp column so sender addresses don't get truncated."""
+    table.add_column("created_ts", overflow="fold", max_width=16)
+
+
+def _new_compact_message_table(title: str) -> Table:
+    """Render multi-column message tables cleanly in 80-column terminals."""
+    return Table(title=title, show_lines=False, pad_edge=False, collapse_padding=True)
+
+
+def _extract_jsonrpc_result(payload: Any, *, request_name: str) -> Any:
+    """Unwrap FastMCP HTTP JSON-RPC responses or raise a CLI-facing server error."""
+    if not isinstance(payload, dict):
+        raise click.ClickException(f"{request_name}: invalid server response")
+    error = payload.get("error")
+    if isinstance(error, dict):
+        message = str(error.get("message") or "server request failed")
+        detail = error.get("data")
+        if isinstance(detail, dict):
+            detail = detail.get("message") or detail.get("detail") or detail
+        if detail not in (None, "", message):
+            message = f"{message}: {detail}"
+        raise click.ClickException(f"{request_name}: {message}")
+    result = payload.get("result")
+    if not isinstance(result, dict):
+        return result
+    structured_missing = object()
+    structured = result.get("structuredContent", structured_missing)
+    if structured is structured_missing:
+        structured = result.get("structured_content", structured_missing)
+    if structured is not structured_missing:
+        if isinstance(structured, dict):
+            return structured.get("result", structured)
+        return structured
+    return result
+
+
+def _parse_jsonrpc_response(response: Any, *, request_name: str) -> Any:
+    """Decode an HTTP JSON-RPC response with a CLI-facing parse error."""
+    try:
+        response.raise_for_status()
+    except httpx.HTTPStatusError as exc:
+        status_code = getattr(getattr(exc, "response", None), "status_code", None)
+        status_suffix = f" HTTP {status_code}" if status_code is not None else " HTTP error"
+        raise click.ClickException(f"{request_name}:{status_suffix} from server") from exc
+    try:
+        payload = response.json()
+    except ValueError as exc:
+        raise click.ClickException(f"{request_name}: invalid JSON response from server") from exc
+    return _extract_jsonrpc_result(payload, request_name=request_name)
+
+
+async def _lookup_agent_registration_token(project_human_key: str, agent_name: str) -> str | None:
+    """Resolve a locally stored registration token for a project/agent pair."""
+    await ensure_schema()
+    async with get_session() as session:
+        result = await session.execute(
+            select(Agent.registration_token)
+            .join(Project, cast(ColumnElement[bool], Agent.project_id == Project.id))
+            .where(
+                cast(ColumnElement[bool], Project.human_key == project_human_key),
+                func.lower(Agent.name) == agent_name.lower(),
+            )
+        )
+        token = result.scalar_one_or_none()
+    if token is None:
+        return None
+    normalized_token = str(token).strip()
+    return normalized_token or None
+
+
+async def _lookup_product_registration_token(product_key: str, agent_name: str) -> str | None:
+    """Resolve a unique locally stored registration token for a product/agent pair."""
+    await ensure_schema()
+    async with get_session() as session:
+        product = (
+            await session.execute(
+                select(Product).where(
+                    or_(
+                        cast(ColumnElement[bool], Product.product_uid == product_key),
+                        cast(ColumnElement[bool], Product.name == product_key),
+                    )
+                )
+            )
+        ).scalars().first()
+        if product is None or product.id is None:
+            return None
+        token_rows = await session.execute(
+            select(Agent.registration_token)
+            .join(Project, cast(ColumnElement[bool], Agent.project_id == Project.id))
+            .join(ProductProjectLink, cast(ColumnElement[bool], ProductProjectLink.project_id == Project.id))
+            .where(
+                cast(ColumnElement[bool], ProductProjectLink.product_id == product.id),
+                func.lower(Agent.name) == agent_name.lower(),
+            )
+        )
+        tokens = {
+            str(token).strip()
+            for token in token_rows.scalars().all()
+            if str(token or "").strip()
+        }
+    if len(tokens) != 1:
+        return None
+    return next(iter(tokens))
+
+
+async def _resolve_local_product_agents(
+    product_key: str,
+    agent_name: str,
+    registration_token: str | None,
+) -> tuple[Product, list[tuple[Project, Agent]], str | None]:
+    """Resolve locally authorized product agents using the same token semantics as the server."""
+    import hmac as _hmac
+
+    await ensure_schema()
+    async with get_session() as session:
+        product = (
+            await session.execute(
+                select(Product).where(
+                    or_(
+                        cast(ColumnElement[bool], Product.product_uid == product_key),
+                        cast(ColumnElement[bool], Product.name == product_key),
+                    )
+                )
+            )
+        ).scalars().first()
+        if product is None:
+            raise ValueError(f"Product '{product_key}' not found")
+        assert product.id is not None
+        rows = await session.execute(
+            select(Project, Agent)
+            .join(ProductProjectLink, cast(ColumnElement[bool], ProductProjectLink.project_id == Project.id))
+            .join(Agent, cast(ColumnElement[bool], Agent.project_id == Project.id))
+            .where(
+                cast(ColumnElement[bool], ProductProjectLink.product_id == product.id),
+                func.lower(Agent.name) == agent_name.lower(),
+            )
+        )
+        project_agents = list(rows.all())
+
+    effective_token = (registration_token or "").strip() or None
+    if effective_token is None:
+        unique_tokens = {
+            str(agent.registration_token).strip()
+            for _project, agent in project_agents
+            if str(agent.registration_token or "").strip()
+        }
+        if len(unique_tokens) == 1:
+            effective_token = next(iter(unique_tokens))
+
+    authorized: list[tuple[Project, Agent]] = []
+    if effective_token is not None:
+        for project, agent in project_agents:
+            stored_token = str(agent.registration_token or "").strip()
+            if stored_token and _hmac.compare_digest(effective_token, stored_token):
+                authorized.append((project, agent))
+
+    return product, authorized, effective_token
+
+
+def _require_cli_product_auth(command_name: str, product_key: str, agent_name: str, effective_token: str | None) -> str:
+    """Require a concrete product auth token for server-first or local fallback reads."""
+    if effective_token:
+        return effective_token
+    raise click.ClickException(
+        f"{command_name} requires --registration-token / $AGENT_MAIL_REGISTRATION_TOKEN for agent '{agent_name}' "
+        f"or a single unambiguous locally stored token linked to product '{product_key}'."
+    )
 
 
 def _run_async(coro: Any) -> Any:
@@ -178,16 +412,28 @@ doctor_app = typer.Typer(help="Diagnose and repair mailbox health issues")
 app.add_typer(doctor_app, name="doctor")
 
 
+def _canonical_project_path(path: Path) -> Path:
+    return Path(_canonicalize_project_identifier(str(path)))
+
+
+def _resolve_repo_worktree_root(path: Path) -> Path:
+    repo = None
+    try:
+        from git import Repo as _Repo
+
+        repo = _Repo(str(path), search_parent_directories=True)
+        return Path(repo.working_tree_dir or str(path))
+    except Exception:
+        return path
+    finally:
+        if repo is not None:
+            with suppress(Exception):
+                repo.close()
+
+
 async def _get_project_record(identifier: str) -> Project:
     raw_identifier = identifier.strip()
-    canonical_identifier = raw_identifier
-    # Resolve absolute paths to canonical form so symlink aliases map to one project.
-    try:
-        candidate = Path(raw_identifier).expanduser()
-        if candidate.is_absolute():
-            canonical_identifier = str(candidate.resolve())
-    except Exception:
-        canonical_identifier = raw_identifier
+    canonical_identifier = await asyncio.to_thread(_canonicalize_project_identifier, raw_identifier)
     slug = slugify(canonical_identifier)
     await ensure_schema()
     async with get_session() as session:
@@ -211,7 +457,12 @@ async def _get_agent_record(project: Project, agent_name: str) -> Agent:
     await ensure_schema()
     async with get_session() as session:
         result = await session.execute(
-            select(Agent).where(and_(cast(ColumnElement[bool], Agent.project_id == project.id), cast(ColumnElement[bool], Agent.name == agent_name)))
+            select(Agent).where(
+                and_(
+                    cast(ColumnElement[bool], Agent.project_id == project.id),
+                    func.lower(Agent.name) == agent_name.lower(),
+                )
+            )
         )
         agent = result.scalars().first()
         if not agent:
@@ -242,6 +493,26 @@ def _ensure_utc_dt(dt: Optional[datetime]) -> Optional[datetime]:
     if dt.tzinfo is None or dt.tzinfo.utcoffset(dt) is None:
         return dt.replace(tzinfo=timezone.utc)
     return dt.astimezone(timezone.utc)
+
+
+def _delete_project_archive_tree(storage_root: str, project_slug: str) -> tuple[int, int, list[str]]:
+    """Best-effort removal of a project's archive subtree."""
+    files_removed = 0
+    dirs_removed = 0
+    fs_errors: list[str] = []
+    try:
+        archive_root = Path(storage_root).expanduser().resolve()
+        project_dir = archive_root / "projects" / project_slug
+        if project_dir.exists():
+            for item in project_dir.rglob("*"):
+                if item.is_file():
+                    files_removed += 1
+                elif item.is_dir():
+                    dirs_removed += 1
+            shutil.rmtree(project_dir)
+    except Exception as exc:
+        fs_errors.append(str(exc))
+    return files_removed, dirs_removed, fs_errors
 
 
 @products_app.command("ensure")
@@ -280,11 +551,10 @@ def products_ensure(
                 },
             }
             resp = client.post(server_url, json=req, headers=headers)
-            data = resp.json()
-            result = (data or {}).get("result") or {}
+            result = _parse_jsonrpc_response(resp, request_name="products ensure") or {}
             if result:
                 resp_data = result
-    except Exception:
+    except httpx.TransportError:
         resp_data = {}
     if not resp_data:
         # Fallback to local DB with the same strict uid policy
@@ -403,6 +673,18 @@ def products_status(
 def products_search(
     product_key: Annotated[str, typer.Argument(..., help="Product uid or name")],
     query: Annotated[str, typer.Argument(..., help="FTS query")],
+    agent: Annotated[
+        Optional[str],
+        typer.Option("--agent", "-a", envvar="AGENT_NAME", help="Agent name (defaults to $AGENT_NAME)"),
+    ] = None,
+    registration_token: Annotated[
+        Optional[str],
+        typer.Option(
+            "--registration-token",
+            envvar="AGENT_MAIL_REGISTRATION_TOKEN",
+            help="Agent registration token (defaults to a unique local linked-project token lookup or $AGENT_MAIL_REGISTRATION_TOKEN)",
+        ),
+    ] = None,
     limit: Annotated[int, typer.Option("--limit", "-l", help="Max results",)] = 20,
 ) -> None:
     """
@@ -413,30 +695,77 @@ def products_search(
     if sanitized_query is None:
         console.print(f"[yellow]Query '{query}' cannot produce search results.[/]")
         return
+    agent_name = (agent or "").strip()
+    if not agent_name:
+        raise click.ClickException("products search requires --agent or $AGENT_NAME.")
+    effective_token = _require_cli_product_auth(
+        "products search",
+        product_key,
+        agent_name,
+        registration_token or _run_async(_lookup_product_registration_token(product_key, agent_name)),
+    )
 
-    async def _run() -> list[dict]:
+    settings = get_settings()
+    server_url = f"http://{settings.http.host}:{settings.http.port}{settings.http.path}"
+    bearer = settings.http.bearer_token or ""
+    rows: list[dict[str, Any]] | None = None
+    try:
+        with httpx.Client(timeout=5.0) as client:
+            headers = {}
+            if bearer:
+                headers["Authorization"] = f"Bearer {bearer}"
+            req = {
+                "jsonrpc": "2.0",
+                "id": "cli-products-search",
+                "method": "tools/call",
+                "params": {
+                    "name": "search_messages_product",
+                    "arguments": {
+                        "product_key": product_key,
+                        "query": query,
+                        "limit": int(limit),
+                        "agent_name": agent_name,
+                        "registration_token": effective_token,
+                    },
+                },
+            }
+            resp = client.post(server_url, json=req, headers=headers)
+            result = _parse_jsonrpc_response(resp, request_name="products search")
+            rows = result if isinstance(result, list) else []
+    except httpx.TransportError:
+        rows = None
+
+    async def _run_local() -> list[dict]:
         await ensure_schema()
-        async with get_session() as session:
-            stmt_prod = select(Product).where(or_(cast(ColumnElement[bool], Product.product_uid == product_key), cast(ColumnElement[bool], Product.name == product_key)))
-            prod = (await session.execute(stmt_prod)).scalars().first()
-            if prod is None:
-                raise typer.BadParameter(f"Product '{product_key}' not found.")
-            assert prod.id is not None
-            rows = await session.execute(
-                select(ProductProjectLink.project_id).where(cast(ColumnElement[bool], ProductProjectLink.product_id == prod.id))
+        product, authorized, _ = await _resolve_local_product_agents(product_key, agent_name, effective_token)
+        proj_ids = [project.id for project, _agent in authorized if project.id is not None]
+        if product.id is None:
+            raise typer.BadParameter(f"Product '{product_key}' not found.")
+        authorized_map = {
+            int(project.id): int(agent.id)
+            for project, agent in authorized
+            if project.id is not None and agent.id is not None
+        }
+        if not authorized_map:
+            raise click.ClickException(
+                f"products search: invalid registration token for agent '{agent_name}' on product '{product_key}'."
             )
-            proj_ids = [int(r[0]) for r in rows.fetchall()]
+        async with get_session() as session:
             if not proj_ids:
                 return []
+            rows_local: list[dict[str, Any]] = []
             try:
                 result = await session.execute(
                     text(
                         """
                         SELECT m.id, m.subject, m.body_md, m.importance, m.ack_required, m.created_ts,
-                               m.thread_id, a.name AS sender_name, m.project_id
+                               m.sender_id, m.thread_id, m.project_id,
+                               a.name AS sender_name, a.project_id AS sender_project_id,
+                               sp.slug AS sender_project_slug
                         FROM fts_messages
                         JOIN messages m ON fts_messages.rowid = m.id
                         JOIN agents a ON m.sender_id = a.id
+                        LEFT JOIN projects sp ON sp.id = a.project_id
                         WHERE m.project_id IN :proj_ids AND fts_messages MATCH :query
                         ORDER BY bm25(fts_messages) ASC
                         LIMIT :limit
@@ -444,22 +773,88 @@ def products_search(
                     ).bindparams(bindparam("proj_ids", expanding=True)),
                     {"proj_ids": proj_ids, "query": sanitized_query, "limit": limit},
                 )
-                return [dict(row) for row in result.mappings().all()]
+                rows_local = [dict(row) for row in result.mappings().all()]
             except Exception:
-                # FTS query failed - return empty results
-                return []
-    rows = _run_async(_run())
+                fallback_terms = _extract_like_terms(query)
+                if not fallback_terms:
+                    return []
+                clauses: list[str] = []
+                params: dict[str, Any] = {"proj_ids": proj_ids, "limit": limit}
+                for idx, term in enumerate(fallback_terms):
+                    key = f"t{idx}"
+                    params[key] = f"%{_like_escape(term)}%"
+                    clauses.append(
+                        f"(m.subject LIKE :{key} ESCAPE '{_LIKE_ESCAPE_CHAR}' OR m.body_md LIKE :{key} ESCAPE '{_LIKE_ESCAPE_CHAR}')"
+                    )
+                where_clause = " AND ".join(clauses)
+                result = await session.execute(
+                    text(
+                        f"""
+                        SELECT m.id, m.subject, m.body_md, m.importance, m.ack_required, m.created_ts,
+                               m.sender_id, m.thread_id, m.project_id,
+                               a.name AS sender_name, a.project_id AS sender_project_id,
+                               sp.slug AS sender_project_slug
+                        FROM messages m
+                        JOIN agents a ON m.sender_id = a.id
+                        LEFT JOIN projects sp ON sp.id = a.project_id
+                        WHERE m.project_id IN :proj_ids AND {where_clause}
+                        ORDER BY m.created_ts DESC
+                        LIMIT :limit
+                        """
+                    ).bindparams(bindparam("proj_ids", expanding=True)),
+                    params,
+                )
+                rows_local = [dict(row) for row in result.mappings().all()]
+
+            visible_rows = rows_local
+            if rows_local:
+                message_ids = [int(row["id"]) for row in rows_local]
+                recipient_rows = await session.execute(
+                    select(MessageRecipient.message_id, MessageRecipient.agent_id).where(
+                        cast(Any, MessageRecipient.message_id).in_(message_ids)
+                    )
+                )
+                recipients_by_message: dict[int, set[int]] = {}
+                for message_id, recipient_agent_id in recipient_rows.all():
+                    recipients_by_message.setdefault(int(message_id), set()).add(int(recipient_agent_id))
+                visible_rows = []
+                for row in rows_local:
+                    project_agent_id = authorized_map.get(int(row["project_id"]))
+                    if project_agent_id is None:
+                        continue
+                    if int(row["sender_id"]) == project_agent_id or project_agent_id in recipients_by_message.get(int(row["id"]), set()):
+                        visible_rows.append(row)
+
+            items: list[dict[str, Any]] = []
+            for item in visible_rows:
+                item["sender_display"] = _cli_sender_display(
+                    message_project_id=item.get("project_id"),
+                    sender_name=item.get("sender_name"),
+                    sender_project_id=item.get("sender_project_id"),
+                    sender_project_slug=item.get("sender_project_slug"),
+                )
+                items.append(item)
+            return items
+
+    if rows is None:
+        rows = _run_async(_run_local())
     if not rows:
         console.print("[yellow]No results.[/]")
         return
-    t = Table(title=f"Product search: '{query}'", show_lines=False)
+    t = _new_compact_message_table(f"Product search: '{query}'")
     t.add_column("project_id")
     t.add_column("id")
     t.add_column("subject")
-    t.add_column("from")
-    t.add_column("created_ts")
+    _add_message_sender_column(t)
+    _add_message_timestamp_column(t)
     for r in rows:
-        t.add_row(str(r["project_id"]), str(r["id"]), r["subject"], r["sender_name"], r["created_ts"].isoformat() if hasattr(r["created_ts"], "isoformat") else str(r["created_ts"]))
+        t.add_row(
+            str(r["project_id"]),
+            str(r["id"]),
+            r["subject"],
+            str(r.get("sender_display") or r.get("sender_name") or "Unknown"),
+            _format_cli_timestamp(r.get("created_ts")),
+        )
     console.print(t)
 
 
@@ -467,6 +862,14 @@ def products_search(
 def products_inbox(
     product_key: Annotated[str, typer.Argument(..., help="Product uid or name")],
     agent: Annotated[str, typer.Argument(..., help="Agent name")],
+    registration_token: Annotated[
+        Optional[str],
+        typer.Option(
+            "--registration-token",
+            envvar="AGENT_MAIL_REGISTRATION_TOKEN",
+            help="Agent registration token (defaults to a unique local linked-project token lookup or $AGENT_MAIL_REGISTRATION_TOKEN)",
+        ),
+    ] = None,
     limit: Annotated[int, typer.Option("--limit", "-l", help="Max messages",)] = 20,
     urgent_only: Annotated[bool, typer.Option("--urgent-only/--all", help="Only high/urgent")] = False,
     include_bodies: Annotated[bool, typer.Option("--include-bodies/--no-bodies", help="Include body_md")] = False,
@@ -479,7 +882,14 @@ def products_inbox(
     settings = get_settings()
     server_url = f"http://{settings.http.host}:{settings.http.port}{settings.http.path}"
     bearer = settings.http.bearer_token or ""
+    effective_token = _require_cli_product_auth(
+        "products inbox",
+        product_key,
+        agent,
+        registration_token or _run_async(_lookup_product_registration_token(product_key, agent)),
+    )
     # Try server first
+    rows: list[dict[str, Any]] | None = None
     try:
         with httpx.Client(timeout=5.0) as client:
             headers = {}
@@ -498,19 +908,29 @@ def products_inbox(
                         "urgent_only": bool(urgent_only),
                         "include_bodies": bool(include_bodies),
                         "since_ts": since_ts or "",
+                        "registration_token": effective_token,
                     },
                 },
             }
             resp = client.post(server_url, json=req, headers=headers)
-            data = resp.json()
-            result = (data or {}).get("result")
+            result = _parse_jsonrpc_response(resp, request_name="products inbox")
             rows = result if isinstance(result, list) else []
-    except Exception:
-        rows = []
-    if not rows:
+    except httpx.TransportError:
+        rows = None
+    if rows is None:
         # Fallback: local DB
         async def _fallback() -> list[dict]:
             await ensure_schema()
+            _product, authorized, _ = await _resolve_local_product_agents(product_key, agent, effective_token)
+            authorized_agent_ids = {
+                int(agent_record.id)
+                for _project, agent_record in authorized
+                if agent_record.id is not None
+            }
+            if not authorized_agent_ids:
+                raise click.ClickException(
+                    f"products inbox: invalid registration token for agent '{agent}' on product '{product_key}'."
+                )
             async with get_session() as session:
                 prod = (await session.execute(select(Product).where(or_(cast(ColumnElement[bool], Product.product_uid == product_key), cast(ColumnElement[bool], Product.name == product_key))))).scalars().first()
                 if prod is None:
@@ -525,16 +945,38 @@ def products_inbox(
                 items: list[dict] = []
                 for proj in projects:
                     assert proj.id is not None
-                    agent_row = (await session.execute(select(Agent).where(and_(cast(ColumnElement[bool], Agent.project_id == proj.id), cast(ColumnElement[bool], Agent.name == agent))))).scalars().first()
+                    agent_row = (
+                        await session.execute(
+                            select(Agent).where(
+                                and_(
+                                    cast(ColumnElement[bool], Agent.project_id == proj.id),
+                                    func.lower(Agent.name) == agent.lower(),
+                                )
+                            )
+                        )
+                    ).scalars().first()
                     if not agent_row:
                         continue
                     assert agent_row.id is not None
+                    if int(agent_row.id) not in authorized_agent_ids:
+                        continue
                     from sqlalchemy.orm import aliased as _aliased  # local to avoid top-level churn
                     sender_alias = _aliased(Agent)
+                    sender_project_alias = _aliased(Project)
                     stmt = (
-                        select(Message, MessageRecipient.kind, sender_alias.name)
+                        select(
+                            Message,
+                            MessageRecipient.kind,
+                            sender_alias.name,
+                            sender_alias.project_id,
+                            sender_project_alias.slug,
+                        )
                         .join(MessageRecipient, cast(ColumnElement[bool], MessageRecipient.message_id == Message.id))
                         .join(sender_alias, cast(ColumnElement[bool], Message.sender_id == sender_alias.id))
+                        .outerjoin(
+                            sender_project_alias,
+                            cast(ColumnElement[bool], sender_alias.project_id == sender_project_alias.id),
+                        )
                         .where(and_(cast(ColumnElement[bool], Message.project_id == proj.id), cast(ColumnElement[bool], MessageRecipient.agent_id == agent_row.id)))
                         .order_by(desc(cast(Any, Message.created_ts)))
                         .limit(limit)
@@ -547,7 +989,7 @@ def products_inbox(
                         if parsed is not None:
                             stmt = stmt.where(Message.created_ts > parsed.replace(tzinfo=None))
                     res = await session.execute(stmt)
-                    for msg, kind, sender_name in res.all():
+                    for msg, kind, sender_name, sender_project_id, sender_project_slug in res.all():
                         payload = {
                             "id": msg.id,
                             "project_id": proj.id,
@@ -555,7 +997,12 @@ def products_inbox(
                             "importance": msg.importance,
                             "ack_required": msg.ack_required,
                             "created_ts": msg.created_ts,
-                            "from": sender_name,
+                            "from": _cli_sender_display(
+                                message_project_id=proj.id,
+                                sender_name=sender_name,
+                                sender_project_id=sender_project_id,
+                                sender_project_slug=sender_project_slug,
+                            ),
                             "kind": kind,
                         }
                         if include_bodies:
@@ -568,18 +1015,22 @@ def products_inbox(
     if not rows:
         console.print("[yellow]No messages found.[/]")
         return
-    t = Table(title=f"Inbox for {agent} in product '{product_key}'", show_lines=False)
+    t = _new_compact_message_table(f"Inbox for {agent} in product '{product_key}'")
     t.add_column("project_id")
     t.add_column("id")
     t.add_column("subject")
-    t.add_column("from")
+    _add_message_sender_column(t)
     t.add_column("importance")
-    t.add_column("created_ts")
+    _add_message_timestamp_column(t)
     for r in rows:
-        created = r.get("created_ts")
-        if hasattr(created, "isoformat"):
-            created = created.isoformat()
-        t.add_row(str(r.get("project_id", "")), str(r.get("id", "")), str(r.get("subject", "")), str(r.get("from", "")), str(r.get("importance", "")), str(created or ""))
+        t.add_row(
+            str(r.get("project_id", "")),
+            str(r.get("id", "")),
+            str(r.get("subject", "")),
+            str(r.get("from", "")),
+            str(r.get("importance", "")),
+            _format_cli_timestamp(r.get("created_ts")),
+        )
     console.print(t)
 
 
@@ -587,15 +1038,36 @@ def products_inbox(
 def products_summarize_thread(
     product_key: Annotated[str, typer.Argument(..., help="Product uid or name")],
     thread_id: Annotated[str, typer.Argument(..., help="Thread id or key")],
+    agent: Annotated[
+        Optional[str],
+        typer.Option("--agent", "-a", envvar="AGENT_NAME", help="Agent name (defaults to $AGENT_NAME)"),
+    ] = None,
+    registration_token: Annotated[
+        Optional[str],
+        typer.Option(
+            "--registration-token",
+            envvar="AGENT_MAIL_REGISTRATION_TOKEN",
+            help="Agent registration token (defaults to a unique local linked-project token lookup or $AGENT_MAIL_REGISTRATION_TOKEN)",
+        ),
+    ] = None,
     per_thread_limit: Annotated[int, typer.Option("--per-thread-limit", "-n", help="Max messages per thread",)] = 50,
     no_llm: Annotated[bool, typer.Option("--no-llm", help="Disable LLM refinement")] = False,
 ) -> None:
     """
     Summarize a thread across all projects in a product. Prefers server tool; minimal fallback if server is unavailable.
     """
+    agent_name = (agent or "").strip()
+    if not agent_name:
+        raise click.ClickException("products summarize-thread requires --agent or $AGENT_NAME.")
     settings = get_settings()
     server_url = f"http://{settings.http.host}:{settings.http.port}{settings.http.path}"
     bearer = settings.http.bearer_token or ""
+    effective_token = _require_cli_product_auth(
+        "products summarize-thread",
+        product_key,
+        agent_name,
+        registration_token or _run_async(_lookup_product_registration_token(product_key, agent_name)),
+    )
     # Try server
     try:
         with httpx.Client(timeout=8.0) as client:
@@ -614,13 +1086,14 @@ def products_summarize_thread(
                         "include_examples": True,
                         "llm_mode": (not no_llm),
                         "per_thread_limit": int(per_thread_limit),
+                        "agent_name": agent_name,
+                        "registration_token": effective_token,
                     },
                 },
             }
             resp = client.post(server_url, json=req, headers=headers)
-            data = resp.json()
-            result = (data or {}).get("result") or {}
-    except Exception:
+            result = _parse_jsonrpc_response(resp, request_name="products summarize-thread") or {}
+    except httpx.TransportError:
         result = {}
     if not result:
         console.print("[yellow]Server unavailable; summarization requires server tool. Try again when server is running.[/]")
@@ -649,13 +1122,18 @@ def products_summarize_thread(
             act.add_row(str(a))
         console.print(act)
     if examples:
-        ex = Table(title="Examples", show_lines=False)
+        ex = _new_compact_message_table("Examples")
         ex.add_column("id")
         ex.add_column("subject")
-        ex.add_column("from")
-        ex.add_column("created_ts")
+        _add_message_sender_column(ex)
+        _add_message_timestamp_column(ex)
         for e in examples:
-            ex.add_row(str(e.get("id", "")), str(e.get("subject", "")), str(e.get("from", "")), str(e.get("created_ts", "")))
+            ex.add_row(
+                str(e.get("id", "")),
+                str(e.get("subject", "")),
+                str(e.get("from", "")),
+                _format_cli_timestamp(e.get("created_ts")),
+            )
         console.print(ex)
 
 
@@ -671,6 +1149,56 @@ async def _get_product_record(key: str) -> Product:
         return prod
 
 
+_SERVER_LOCK_FILENAME = "server.lock"
+
+
+def _acquire_server_lock(settings: Any = None) -> BaseFileLock:
+    """Acquire an exclusive lock on server.lock inside the resolved STORAGE_ROOT.
+
+    Ensures only one Agent Mail server process can own a given storage root at a
+    time.  Uses OS-level file locking (flock/fcntl on Unix, LockFileEx on
+    Windows) so the lock is automatically released if the process crashes —
+    unlike SoftFileLock which leaves a stale marker file on disk.
+
+    The PID is written into a companion .pid file for diagnostic purposes.
+
+    Returns the held ``FileLock`` so the caller can keep a reference alive
+    (preventing GC from closing the file descriptor and releasing the lock).
+    Raises ``SystemExit(1)`` if another server already holds the lock.
+    """
+    if settings is None:
+        settings = get_settings()
+    storage_root = Path(settings.storage.root).expanduser().resolve()
+    storage_root.mkdir(parents=True, exist_ok=True)
+    lock_path = storage_root / _SERVER_LOCK_FILENAME
+    lock = FileLock(str(lock_path))
+    try:
+        lock.acquire(timeout=0)
+    except LockTimeout as exc:
+        # Try to read the PID from the companion .pid file for a helpful message
+        owner_pid = "(unknown)"
+        pid_path = storage_root / "server.pid"
+        with suppress(OSError):
+            owner_pid = pid_path.read_text(encoding="utf-8").strip() or "(unknown)"
+        print(
+            f"ERROR: Another Agent Mail server is already running for this "
+            f"storage root (PID: {owner_pid}). Only one server can own a "
+            f"storage root at a time.\n"
+            f"  Storage root: {storage_root}\n"
+            f"  Lock file:    {lock_path}",
+            file=sys.stderr,
+        )
+        raise SystemExit(1) from exc
+    # Write our PID to a companion file for diagnostics (not the lock file
+    # itself, which is managed by the OS-level locking mechanism)
+    try:
+        pid_path = storage_root / "server.pid"
+        pid_path.write_text(str(os.getpid()), encoding="utf-8")
+    except OSError:
+        pass  # Non-fatal; the lock itself is what matters
+    return lock
+
+
 @app.command("serve-http")
 def serve_http(
     host: Optional[str] = typer.Option(None, help="Host interface for HTTP transport. Defaults to HTTP_HOST setting."),
@@ -679,13 +1207,28 @@ def serve_http(
 ) -> None:
     """Run the MCP server over the Streamable HTTP transport."""
     settings = get_settings()
+
+    # Enforce single-server ownership of the storage root (issue #123)
+    _server_lock = _acquire_server_lock(settings)
+
     resolved_host = host or settings.http.host
     resolved_port = port or settings.http.port
     resolved_path = path or settings.http.path
+    effective_settings = replace(
+        settings,
+        http=replace(settings.http, host=resolved_host, port=resolved_port, path=resolved_path),
+    )
 
     # Display awesome startup banner with database stats
     from . import rich_logger
-    rich_logger.display_startup_banner(settings, resolved_host, resolved_port, resolved_path)
+    rich_logger.display_startup_banner(effective_settings, resolved_host, resolved_port, resolved_path)
+
+    # Reset database state after startup banner to prevent connection leak.
+    # The banner's _get_database_stats() uses _run_async() which creates connections
+    # on a temporary event loop. When uvicorn starts with its own loop, those
+    # connections become orphaned and cause SQLAlchemy GC warnings. Resetting
+    # here ensures fresh connections are created on the main event loop.
+    reset_database_state()
 
     # Reset database state after startup banner to prevent connection leak.
     # The banner's _get_database_stats() uses _run_async() which creates connections
@@ -695,7 +1238,7 @@ def serve_http(
     reset_database_state()
 
     server = build_mcp_server()
-    app = build_http_app(settings, server)
+    app = build_http_app(effective_settings, server)
     # Disable WebSockets: HTTP-only MCP transport. Stay compatible with tests that
     # monkeypatch uvicorn.run without the 'ws' parameter.
     import inspect as _inspect
@@ -720,13 +1263,14 @@ def serve_stdio() -> None:
     """
     import logging
 
-    from .config import clear_settings_cache
-
     # Disable tool debug logging and rich console output - they output to stdout
     # and would corrupt the stdio protocol
     os.environ["TOOLS_LOG_ENABLED"] = "false"
     os.environ["LOG_RICH_ENABLED"] = "false"
     clear_settings_cache()
+
+    # Enforce single-server ownership of the storage root (issue #123)
+    _server_lock = _acquire_server_lock()
 
     # Redirect all logging to stderr to avoid corrupting stdio transport
     for handler in logging.root.handlers[:]:
@@ -1425,6 +1969,7 @@ def share_update(
     scope = None
     scrub_summary = None
     fts_enabled = False
+    sync_result = BundleSyncResult()
 
     with tempfile.TemporaryDirectory(prefix="mailbox-share-update-") as temp_dir_name:
         temp_path = Path(temp_dir_name)
@@ -1490,7 +2035,7 @@ def share_update(
             )
 
         console.print(f"[cyan]Synchronizing updated bundle into:[/] {bundle_path}")
-        _copy_bundle_contents(temp_path, bundle_path)
+        sync_result = _copy_bundle_contents(temp_path, bundle_path)
 
     assert scope is not None and scrub_summary is not None
 
@@ -1511,9 +2056,14 @@ def share_update(
             console.print(f"[red]Manifest signing failed:[/] {exc}")
             raise typer.Exit(code=1) from exc
     elif existing_signature:
-        console.print(
-            "[yellow]Existing manifest signature may no longer match. Re-run with --signing-key to refresh it.[/]"
-        )
+        if (bundle_path / "manifest.sig.json").exists():
+            console.print(
+                "[yellow]Existing manifest signature may no longer match. Re-run with --signing-key to refresh it.[/]"
+            )
+        else:
+            console.print(
+                "[yellow]Removed stale manifest.sig.json during update. Re-run with --signing-key to refresh the signature.[/]"
+            )
 
     archive_path: Optional[Path] = None
     if zip_bundle:
@@ -1565,7 +2115,15 @@ def share_update(
         console.print("[yellow]Search fallback active (FTS5 unavailable in current sqlite build).[/]")
     if chunk_manifest:
         console.print("[green]✓ Chunk manifest refreshed (mailbox.sqlite3.config.json updated).[/]")
-        console.print("[dim]Existing chunk files beyond the new chunk count remain on disk; remove them manually if needed.[/]")
+        pruned_chunk_files = [
+            path
+            for path in sync_result.removed_files
+            if path.is_relative_to(bundle_path / "chunks")
+        ]
+        if pruned_chunk_files:
+            console.print(
+                f"[green]✓ Pruned {len(pruned_chunk_files)} stale chunk file(s) during bundle sync.[/]"
+            )
 
     if zip_bundle and archive_path:
         console.print(f"[green]✓ Bundle archive available at {archive_path}[/]")
@@ -1851,11 +2409,24 @@ class StoredExportConfig:
     scrub_preset: str
 
 
+@dataclass(slots=True)
+class BundleSyncResult:
+    removed_files: tuple[Path, ...] = ()
+    removed_dirs: tuple[Path, ...] = ()
+
+
 def _coerce_int(value: Any, default: int) -> int:
     try:
         return int(value)
     except (TypeError, ValueError):
         return default
+
+
+def _coalesce(*values: Any) -> Any:
+    for value in values:
+        if value is not None:
+            return value
+    return None
 
 
 def _load_bundle_export_config(bundle_dir: Path) -> StoredExportConfig:
@@ -1880,18 +2451,18 @@ def _load_bundle_export_config(bundle_dir: Path) -> StoredExportConfig:
     scrub_preset = str(export_config.get("scrub_preset") or scrub_section.get("preset") or "standard")
 
     inline_threshold = _coerce_int(
-        export_config.get("inline_threshold") or attachments_config.get("inline_threshold"),
+        _coalesce(export_config.get("inline_threshold"), attachments_config.get("inline_threshold")),
         INLINE_ATTACHMENT_THRESHOLD,
     )
     detach_threshold = _coerce_int(
-        export_config.get("detach_threshold") or attachments_config.get("detach_threshold"),
+        _coalesce(export_config.get("detach_threshold"), attachments_config.get("detach_threshold")),
         DETACH_ATTACHMENT_THRESHOLD,
     )
     chunk_threshold = _coerce_int(export_config.get("chunk_threshold"), DEFAULT_CHUNK_THRESHOLD)
 
     chunk_manifest = database_section.get("chunk_manifest") or {}
     chunk_size = _coerce_int(
-        export_config.get("chunk_size") or chunk_manifest.get("chunk_size"),
+        _coalesce(export_config.get("chunk_size"), chunk_manifest.get("chunk_size")),
         DEFAULT_CHUNK_SIZE,
     )
 
@@ -1916,7 +2487,7 @@ def _load_bundle_export_config(bundle_dir: Path) -> StoredExportConfig:
     )
 
 
-def _copy_bundle_contents(source: Path, destination: Path) -> None:
+def _copy_bundle_contents(source: Path, destination: Path) -> BundleSyncResult:
     """Synchronise *destination* with *source* by mirroring files and pruning stale artefacts."""
 
     source = source.resolve()
@@ -1941,15 +2512,18 @@ def _copy_bundle_contents(source: Path, destination: Path) -> None:
 
     # Remove files that are no longer present in the source bundle.
     existing_files = {path for path in destination.rglob("*") if path.is_file()}
-    for stale_file in existing_files - desired_files:
+    stale_files = tuple(sorted(existing_files - desired_files))
+    for stale_file in stale_files:
         # Unlink without following symlinks (we never export symlinks, but be defensive).
         stale_file.unlink(missing_ok=True)
 
     # Remove directories that are no longer needed (deepest first).
     existing_dirs = {path for path in destination.rglob("*") if path.is_dir()}
+    removed_dirs: list[Path] = []
     for stale_dir in sorted(existing_dirs - desired_dirs, key=lambda p: len(p.parts), reverse=True):
         with suppress(OSError):
             stale_dir.rmdir()
+            removed_dirs.append(stale_dir)
 
     # Copy fresh files from source (overwrite in place to handle updated content).
     for root, _, files in os.walk(source):
@@ -1962,16 +2536,20 @@ def _copy_bundle_contents(source: Path, destination: Path) -> None:
             dest_file = dest_root / filename
             shutil.copy2(src_file, dest_file)
 
+    return BundleSyncResult(removed_files=stale_files, removed_dirs=tuple(removed_dirs))
+
 
 def _detect_project_root() -> Path:
     cwd = Path.cwd().resolve()
     candidates = [cwd, *cwd.parents]
-    for candidate in candidates:
-        if (candidate / "pyproject.toml").exists():
-            return candidate
+    pyproject_candidate: Path | None = None
     for candidate in candidates:
         if (candidate / ".git").exists():
             return candidate
+        if pyproject_candidate is None and (candidate / "pyproject.toml").exists():
+            pyproject_candidate = candidate
+    if pyproject_candidate is not None:
+        return pyproject_candidate
     return cwd
 
 
@@ -2002,10 +2580,48 @@ def _format_bytes(value: int) -> str:
     return f"{int(value)} B"
 
 
-def _detect_git_head(repo_path: Path) -> str | None:
-    git_dir = repo_path / ".git"
-    if not git_dir.exists():
+def _resolve_git_dir(repo_path: Path) -> Path | None:
+    git_entry = repo_path / ".git"
+    if git_entry.is_dir():
+        return git_entry
+    if not git_entry.is_file():
         return None
+    try:
+        contents = git_entry.read_text(encoding="utf-8").strip()
+    except OSError:
+        return None
+    if not contents.lower().startswith("gitdir:"):
+        return None
+    git_dir_raw = contents.split(":", 1)[1].strip()
+    if not git_dir_raw:
+        return None
+    git_dir = Path(git_dir_raw)
+    if not git_dir.is_absolute():
+        git_dir = (repo_path / git_dir).resolve()
+    return git_dir
+
+
+def _resolve_common_git_dir(git_dir: Path) -> Path:
+    common_dir_file = git_dir / "commondir"
+    if not common_dir_file.exists():
+        return git_dir
+    try:
+        common_dir_raw = common_dir_file.read_text(encoding="utf-8").strip()
+    except OSError:
+        return git_dir
+    if not common_dir_raw:
+        return git_dir
+    common_dir = Path(common_dir_raw)
+    if not common_dir.is_absolute():
+        common_dir = (git_dir / common_dir).resolve()
+    return common_dir
+
+
+def _detect_git_head(repo_path: Path) -> str | None:
+    git_dir = _resolve_git_dir(repo_path)
+    if git_dir is None:
+        return None
+    common_git_dir = _resolve_common_git_dir(git_dir)
     head_path = git_dir / "HEAD"
     try:
         head_contents = head_path.read_text(encoding="utf-8").strip()
@@ -2015,11 +2631,11 @@ def _detect_git_head(repo_path: Path) -> str | None:
         return None
     if head_contents.startswith("ref:"):
         ref_name = head_contents.split(" ", 1)[1].strip()
-        ref_path = git_dir / ref_name
+        ref_path = common_git_dir / ref_name
         if ref_path.exists():
             with suppress(OSError):
                 return ref_path.read_text(encoding="utf-8").strip()
-        packed_refs = git_dir / "packed-refs"
+        packed_refs = common_git_dir / "packed-refs"
         if packed_refs.exists():
             with suppress(OSError):
                 for line in packed_refs.read_text(encoding="utf-8").splitlines():
@@ -2078,7 +2694,7 @@ def _load_archive_metadata(zip_path: Path) -> tuple[dict[str, Any], str | None]:
             return cast(dict[str, Any], data), None
     except KeyError:
         return {}, f"{ARCHIVE_METADATA_FILENAME} missing"
-    except (OSError, json.JSONDecodeError) as exc:
+    except (BadZipFile, OSError, json.JSONDecodeError) as exc:
         return {}, f"Invalid metadata: {exc}"
 
 
@@ -2101,6 +2717,98 @@ def _next_backup_path(path: Path, timestamp: str) -> Path:
         candidate = path.with_name(f"{path.name}.backup-{timestamp}-{counter:02d}")
         counter += 1
     return candidate
+
+
+def _resolve_archive_member_path(destination_root: Path, member_name: str) -> Path:
+    normalized_name = member_name.rstrip("/")
+    if not normalized_name:
+        raise ShareExportError("Archive contains an empty member name.")
+    if "\\" in normalized_name:
+        raise ShareExportError(
+            f"Invalid archive member path {member_name!r}: backslashes are not allowed."
+        )
+
+    relative_path = PurePosixPath(normalized_name)
+    if relative_path.is_absolute() or any(part == ".." for part in relative_path.parts):
+        raise ShareExportError(
+            f"Invalid archive member path {member_name!r}: directory traversal is not allowed."
+        )
+
+    candidate = (destination_root / Path(*relative_path.parts)).resolve()
+    try:
+        candidate.relative_to(destination_root)
+    except ValueError as exc:
+        raise ShareExportError(
+            f"Invalid archive member path {member_name!r}: directory traversal is not allowed."
+        ) from exc
+    return candidate
+
+
+def _extract_archive_safely(zip_path: Path, destination_root: Path) -> None:
+    destination_root = destination_root.resolve()
+    try:
+        with ZipFile(zip_path, "r") as archive:
+            for member in archive.infolist():
+                target_path = _resolve_archive_member_path(destination_root, member.filename)
+                if member.is_dir():
+                    target_path.mkdir(parents=True, exist_ok=True)
+                    continue
+                target_path.parent.mkdir(parents=True, exist_ok=True)
+                with archive.open(member) as source, target_path.open("wb") as destination:
+                    shutil.copyfileobj(source, destination)
+    except BadZipFile as exc:
+        raise ShareExportError(f"Failed to read archive {zip_path}: {exc}") from exc
+    except OSError as exc:
+        raise ShareExportError(f"Failed to extract archive {zip_path}: {exc}") from exc
+
+
+def _remove_restore_target(path: Path) -> None:
+    if not path.exists():
+        return
+    if path.is_dir():
+        shutil.rmtree(path)
+    else:
+        path.unlink()
+
+
+def _rollback_archive_restore(
+    *,
+    database_path: Path,
+    storage_root: Path,
+    db_backup: Optional[Path],
+    sidecar_backups: Sequence[tuple[Path, Path]],
+    storage_backup: Optional[Path],
+) -> list[str]:
+    rollback_errors: list[str] = []
+
+    def _copy_back(source: Path, destination: Path) -> None:
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        if source.is_dir():
+            shutil.copytree(source, destination, dirs_exist_ok=False)
+        else:
+            shutil.copy2(source, destination)
+
+    targets_to_clear = [database_path, storage_root, *(target for target, _backup in sidecar_backups)]
+    for target in targets_to_clear:
+        try:
+            _remove_restore_target(target)
+        except OSError as exc:
+            rollback_errors.append(f"Failed to clear partial restore target {target}: {exc}")
+
+    restore_pairs: list[tuple[Path, Path]] = []
+    if db_backup is not None:
+        restore_pairs.append((db_backup, database_path))
+    restore_pairs.extend((backup, target) for target, backup in sidecar_backups)
+    if storage_backup is not None:
+        restore_pairs.append((storage_backup, storage_root))
+
+    for source, destination in restore_pairs:
+        try:
+            _copy_back(source, destination)
+        except OSError as exc:
+            rollback_errors.append(f"Failed to restore {destination} from backup {source}: {exc}")
+
+    return rollback_errors
 
 
 def _create_mailbox_archive(
@@ -2249,10 +2957,16 @@ def archive_list_states(
 ) -> None:
     archive_dir = _archive_states_dir(create=False)
     if not archive_dir.exists():
+        if json_output:
+            typer.echo("[]")
+            return
         console.print(f"[yellow]Archive directory {archive_dir} does not exist yet.[/]")
         raise typer.Exit(code=0)
     files = sorted(archive_dir.glob("*.zip"), key=lambda path: path.stat().st_mtime, reverse=True)
     if not files:
+        if json_output:
+            typer.echo("[]")
+            return
         console.print(f"[yellow]No saved mailbox states found under {archive_dir}.[/]")
         raise typer.Exit(code=0)
     if limit > 0:
@@ -2346,8 +3060,11 @@ def archive_restore_state(
         )
     with tempfile.TemporaryDirectory(prefix="mailbox-restore-") as temp_dir_str:
         temp_dir = Path(temp_dir_str)
-        with ZipFile(archive_path, "r") as archive:
-            archive.extractall(temp_dir)
+        try:
+            _extract_archive_safely(archive_path, temp_dir)
+        except ShareExportError as exc:
+            console.print(f"[red]Failed to extract archive:[/] {exc}")
+            raise typer.Exit(code=1) from exc
         snapshot_src = temp_dir / ARCHIVE_SNAPSHOT_RELATIVE
         storage_src = temp_dir / ARCHIVE_STORAGE_DIRNAME
         if not snapshot_src.exists():
@@ -2380,6 +3097,9 @@ def archive_restore_state(
             if not typer.confirm("Proceed with restore?", default=False):
                 raise typer.Exit(code=1)
         backup_paths: list[Path] = []
+        db_backup: Optional[Path] = None
+        sidecar_backups: list[tuple[Path, Path]] = []
+        storage_backup: Optional[Path] = None
         if database_path.exists():
             db_backup = _next_backup_path(database_path, timestamp)
             shutil.move(str(database_path), str(db_backup))
@@ -2390,14 +3110,32 @@ def archive_restore_state(
                 wal_backup = _next_backup_path(wal_path, timestamp)
                 shutil.move(str(wal_path), str(wal_backup))
                 backup_paths.append(wal_backup)
+                sidecar_backups.append((wal_path, wal_backup))
         if storage_root.exists():
             storage_backup = _next_backup_path(storage_root, timestamp)
             shutil.move(str(storage_root), str(storage_backup))
             backup_paths.append(storage_backup)
-        database_path.parent.mkdir(parents=True, exist_ok=True)
-        shutil.copy2(snapshot_src, database_path)
-        storage_root.parent.mkdir(parents=True, exist_ok=True)
-        shutil.copytree(storage_src, storage_root, dirs_exist_ok=False)
+        try:
+            database_path.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(snapshot_src, database_path)
+            storage_root.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copytree(storage_src, storage_root, dirs_exist_ok=False)
+        except OSError as exc:
+            rollback_errors = _rollback_archive_restore(
+                database_path=database_path,
+                storage_root=storage_root,
+                db_backup=db_backup,
+                sidecar_backups=sidecar_backups,
+                storage_backup=storage_backup,
+            )
+            console.print(f"[red]Restore failed:[/] {exc}")
+            if rollback_errors:
+                console.print("[yellow]Rollback encountered issues:[/]")
+                for error in rollback_errors:
+                    console.print(f"  • {error}")
+            else:
+                console.print("[yellow]Original database and storage were restored from backups.[/]")
+            raise typer.Exit(code=1) from exc
     console.print(f"[green]✓ Restore complete from {archive_path}.[/]")
     if backup_paths:
         console.print("[dim]Backups preserved at:[/]")
@@ -2534,6 +3272,18 @@ def hard_delete_agent(
         Optional[str],
         typer.Option("--token", "-t", help="Registration token for token-protected agents."),
     ] = None,
+    legacy_cleanup: Annotated[
+        bool,
+        typer.Option(
+            "--legacy-cleanup",
+            help=(
+                "Bypass the registration_token check for agents whose token is NULL "
+                "(pre-token legacy rows that accumulated before tokens were mandatory). "
+                "Only honored when the target agent's registration_token is genuinely empty; "
+                "token-bearing agents still require --token."
+            ),
+        ),
+    ] = False,
 ) -> None:
     """Permanently delete an agent and ALL associated data (messages, files, database records).
 
@@ -2557,8 +3307,18 @@ def hard_delete_agent(
         proj = await _get_project_record(project)
         agent = await _get_agent_record(proj, agent_name)
 
-        # Verify registration token if the agent has one
-        if agent.registration_token and not _hmac.compare_digest(registration_token or "", agent.registration_token):
+        if not agent.registration_token:
+            if not legacy_cleanup:
+                raise ValueError(
+                    "Agent has no registration_token, so hard delete cannot be authenticated. "
+                    "Re-register or mint a token locally before retrying, or re-run with "
+                    "--legacy-cleanup to delete this tokenless legacy row without a token."
+                )
+            console.print(
+                f"[yellow]--legacy-cleanup: deleting tokenless legacy agent "
+                f"'{agent_name}' in project '{project}' without token check.[/]"
+            )
+        elif not _hmac.compare_digest(registration_token or "", agent.registration_token):
             raise ValueError("Invalid registration_token — only the agent's owner can hard-delete it")
 
         agent_id = agent.id
@@ -2735,22 +3495,26 @@ def hard_delete_project(
         project_id = proj.id
         project_slug = proj.slug
 
-        # Verify caller owns at least one agent in this project
+        # Verify caller owns at least one token-bearing agent in this project
         async with get_session() as session:
             agents_result = await session.execute(
                 select(Agent).where(
                     cast(Any, Agent.project_id) == project_id,
-                    Agent.registration_token.isnot(None),
+                    cast(Any, Agent.registration_token).isnot(None),
                 )
             )
             token_agents = agents_result.scalars().all()
-            if token_agents:
-                if not registration_token or not any(
-                    _hmac.compare_digest(registration_token, a.registration_token)
-                    for a in token_agents
-                    if a.registration_token
-                ):
-                    raise ValueError("Invalid registration_token — must match a registered agent in the project")
+            if not token_agents:
+                raise ValueError(
+                    "Project has no token-bearing agents, so hard delete cannot be authenticated. "
+                    "Register or create an agent identity first."
+                )
+            if not registration_token or not any(
+                _hmac.compare_digest(registration_token, a.registration_token)
+                for a in token_agents
+                if a.registration_token
+            ):
+                raise ValueError("Invalid registration_token — must match a registered agent in the project")
 
         deleted_counts: dict[str, int] = {}
 
@@ -2866,21 +3630,11 @@ def hard_delete_project(
             await session.commit()
 
         # Phase 2: Filesystem cleanup (best-effort)
-        files_removed = 0
-        dirs_removed = 0
-        fs_errors: list[str] = []
-        try:
-            archive_root = Path(settings.storage.root).expanduser().resolve()
-            project_dir = archive_root / "projects" / project_slug
-            if project_dir.exists():
-                for item in project_dir.rglob("*"):
-                    if item.is_file():
-                        files_removed += 1
-                    elif item.is_dir():
-                        dirs_removed += 1
-                shutil.rmtree(project_dir)
-        except Exception as exc:
-            fs_errors.append(str(exc))
+        files_removed, dirs_removed, fs_errors = await asyncio.to_thread(
+            _delete_project_archive_tree,
+            settings.storage.root,
+            project_slug,
+        )
 
         deleted_counts["archive_files_removed"] = files_removed
         deleted_counts["archive_dirs_removed"] = dirs_removed
@@ -2952,11 +3706,18 @@ def list_projects(
                 rows = [(project, 0) for project in projects]
             return rows
 
-    if not json_output:
-        with console.status("Collecting project data..."):
+    try:
+        if not json_output:
+            with console.status("Collecting project data..."):
+                rows = _run_async(_collect())
+        else:
             rows = _run_async(_collect())
-    else:
-        rows = _run_async(_collect())
+    except Exception as exc:
+        if json_output:
+            console.print_json(json.dumps({"error": str(exc)}))
+        else:
+            console.print(f"[red]Failed to list projects:[/] {exc}")
+        raise typer.Exit(code=1) from exc
 
     if json_output:
         # Machine-readable JSON output
@@ -3112,7 +3873,7 @@ def amctl_env(
     """
     Print environment variables useful for build wrappers (slots, caches, artifacts).
     """
-    p = project_path.expanduser().resolve()
+    p = _resolve_repo_worktree_root(_canonical_project_path(project_path))
     agent_name = agent or os.environ.get("AGENT_NAME") or "Unknown"
     # Reuse server helper for identity
     from mcp_agent_mail.app import _resolve_project_identity as _resolve_ident
@@ -3141,12 +3902,22 @@ def amctl_env(
     cache_key = f"am-cache-{project_uid}-{agent_name}-{branch}"
     artifact_dir = Path(settings.storage.root).expanduser().resolve() / "projects" / slug / "artifacts" / agent_name / branch
     # Print as KEY=VALUE lines
-    console.print(f"SLUG={slug}")
-    console.print(f"PROJECT_UID={project_uid}")
-    console.print(f"BRANCH={branch}")
-    console.print(f"AGENT={agent_name}")
-    console.print(f"CACHE_KEY={cache_key}")
-    console.print(f"ARTIFACT_DIR={artifact_dir}")
+    typer.echo(f"SLUG={slug}")
+    typer.echo(f"PROJECT_UID={project_uid}")
+    typer.echo(f"BRANCH={branch}")
+    typer.echo(f"AGENT={agent_name}")
+    typer.echo(f"CACHE_KEY={cache_key}")
+    typer.echo(f"ARTIFACT_DIR={artifact_dir}")
+
+
+def _effective_build_slot_ttl_seconds(ttl_seconds: int) -> int:
+    """Normalize build-slot TTLs to the same 60-second floor enforced by the server."""
+    return max(60, int(ttl_seconds))
+
+
+def _build_slot_renew_interval_seconds(ttl_seconds: int) -> int:
+    """Renew halfway through the effective TTL so leases do not expire on the boundary."""
+    return max(1, _effective_build_slot_ttl_seconds(ttl_seconds) // 2)
 
 
 @app.command(name="am-run")
@@ -3155,6 +3926,14 @@ def am_run(
     cmd: Annotated[list[str], typer.Argument(help="Command to run")],
     project_path: Annotated[Path, typer.Option("--path", "-p", help="Path to repo/worktree",)] = Path(),
     agent: Annotated[Optional[str], typer.Option("--agent", "-a", help="Agent name (defaults to $AGENT_NAME)")] = None,
+    registration_token: Annotated[
+        Optional[str],
+        typer.Option(
+            "--registration-token",
+            envvar="AGENT_MAIL_REGISTRATION_TOKEN",
+            help="Agent registration token (defaults to local DB lookup or $AGENT_MAIL_REGISTRATION_TOKEN)",
+        ),
+    ] = None,
     ttl_seconds: Annotated[int, typer.Option("--ttl-seconds", help="Lease TTL seconds (default 3600)")] = 3600,
     shared: Annotated[bool, typer.Option("--shared/--exclusive", help="Shared (non-exclusive) lease",)] = False,
     block_on_conflicts: Annotated[bool, typer.Option("--block-on-conflicts/--no-block-on-conflicts", help="Exit 1 if exclusive conflicts are present")] = False,
@@ -3165,15 +3944,13 @@ def am_run(
     - Renews lease in the background while the child runs.
     - Releases the slot on exit.
     """
-    p = project_path.expanduser().resolve()
+    p = _resolve_repo_worktree_root(_canonical_project_path(project_path))
     agent_name = agent or os.environ.get("AGENT_NAME") or "Unknown"
     from mcp_agent_mail.app import _resolve_project_identity as _resolve_ident
     ident = _resolve_ident(str(p))
     slug = ident["slug"]
     project_uid = ident["project_uid"]
     branch = ident.get("branch") or ""
-    # Always ensure archive structure exists (for tests and local runs)
-    _run_async(ensure_archive(get_settings(), slug))
     if not branch:
         repo = None
         try:
@@ -3194,6 +3971,10 @@ def am_run(
     worktrees_enabled = bool(settings.worktrees_enabled)
     server_url = f"http://{settings.http.host}:{settings.http.port}{settings.http.path}"
     bearer = settings.http.bearer_token or ""
+    server_request_timeout_seconds = 5.0
+    effective_ttl_seconds = _effective_build_slot_ttl_seconds(ttl_seconds)
+    renew_interval_seconds = _build_slot_renew_interval_seconds(ttl_seconds)
+    archive = _run_async(ensure_archive(settings, slug))
 
     def _safe_component(value: str) -> str:
         s = value.strip()
@@ -3202,10 +3983,26 @@ def am_run(
         return s or "unknown"
 
     async def _ensure_slot_paths() -> Path:
-        archive = await ensure_archive(settings, slug)
         slot_dir = archive.root / "build_slots" / _safe_component(slot)
-        slot_dir.mkdir(parents=True, exist_ok=True)
+        await asyncio.to_thread(slot_dir.mkdir, parents=True, exist_ok=True)
         return slot_dir
+
+    def _is_active_lease(data: dict[str, Any], now: datetime) -> bool:
+        if data.get("released_ts"):
+            return False
+        exp = data.get("expires_ts")
+        if exp:
+            parsed = _parse_iso_datetime(exp)
+            if parsed is not None and parsed <= now:
+                return False
+        return True
+
+    def _read_existing_lease(path: Path) -> dict[str, Any] | None:
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+        except Exception:
+            return None
+        return data if isinstance(data, dict) else None
 
     def _read_active(slot_dir: Path) -> list[dict[str, Any]]:
         now = datetime.now(timezone.utc)
@@ -3213,12 +4010,8 @@ def am_run(
         for f in slot_dir.glob("*.json"):
             try:
                 data = json.loads(f.read_text(encoding="utf-8"))
-                exp = data.get("expires_ts")
-                if exp:
-                    parsed = _parse_iso_datetime(exp)
-                    if parsed is not None and parsed <= now:
-                        continue
-                results.append(data)
+                if isinstance(data, dict) and _is_active_lease(data, now):
+                    results.append(data)
             except Exception:
                 continue
         return results
@@ -3226,23 +4019,65 @@ def am_run(
     def _lease_path(slot_dir: Path) -> Path:
         holder = _safe_component(f"{agent_name}__{branch or 'unknown'}")
         return slot_dir / f"{holder}.json"
-    # Ensure local lease path exists upfront so tests can observe it even if server path is used
-    lease_path: Optional[Path] = None
-    try:
-        slot_dir_eager = _run_async(_ensure_slot_paths())
-        lease_path = _lease_path(slot_dir_eager)
-        payload = {
-            "slot": slot,
-            "agent": agent_name,
-            "branch": branch,
-            "exclusive": (not shared),
-            "acquired_ts": datetime.now(timezone.utc).isoformat(),
-            "expires_ts": (datetime.now(timezone.utc) + timedelta(seconds=ttl_seconds)).isoformat(),
-        }
+
+    def _write_local_release(path: Path) -> None:
+        now = datetime.now(timezone.utc)
+        data = _read_existing_lease(path)
+        if data is None or not _is_active_lease(data, now):
+            return
+        data.update({"released_ts": now.isoformat(), "expires_ts": now.isoformat()})
         with suppress(Exception):
-            lease_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
-    except Exception:
-        pass
+            path.write_text(json.dumps(data, indent=2), encoding="utf-8")
+
+    def _write_local_renew(path: Path) -> None:
+        now = datetime.now(timezone.utc)
+        current = _read_existing_lease(path) or {}
+        if not _is_active_lease(current, now):
+            return
+        current_exp = _parse_iso_datetime(cast(str | None, current.get("expires_ts")))
+        base = max(now, current_exp) if current_exp is not None else now
+        new_exp = base + timedelta(seconds=effective_ttl_seconds)
+        current.update({"slot": slot, "agent": agent_name, "branch": branch, "expires_ts": new_exp.isoformat()})
+        with suppress(Exception):
+            path.write_text(json.dumps(current, indent=2), encoding="utf-8")
+
+    async def _acquire_local_lease_with_lock() -> tuple[list[dict[str, Any]], Path, dict[str, Any]]:
+        async with archive_write_lock(archive):
+            slot_dir = await _ensure_slot_paths()
+            active = await asyncio.to_thread(_read_active, slot_dir)
+            conflicts = [
+                entry for entry in active
+                if not (entry.get("agent") == agent_name and entry.get("branch") == branch)
+                and ((not shared) or entry.get("exclusive", True))
+            ]
+            lease_path = _lease_path(slot_dir)
+            now = datetime.now(timezone.utc)
+            current = await asyncio.to_thread(_read_existing_lease, lease_path)
+            active_current = current if current is not None and _is_active_lease(current, now) else None
+            requested_exp = now + timedelta(seconds=effective_ttl_seconds)
+            current_exp = _parse_iso_datetime(cast(str | None, active_current.get("expires_ts"))) if active_current else None
+            payload = {
+                "slot": slot,
+                "agent": agent_name,
+                "branch": branch,
+                "exclusive": (not shared),
+                "acquired_ts": cast(str, active_current.get("acquired_ts")) if active_current is not None and isinstance(active_current.get("acquired_ts"), str) else now.isoformat(),
+                "expires_ts": max(requested_exp, current_exp).isoformat() if current_exp is not None else requested_exp.isoformat(),
+            }
+            with suppress(Exception):
+                await asyncio.to_thread(lease_path.write_text, json.dumps(payload, indent=2), encoding="utf-8")
+            return conflicts, lease_path, payload
+
+    async def _renew_local_lease_with_lock(path: Path) -> None:
+        async with archive_write_lock(archive):
+            await asyncio.to_thread(_write_local_renew, path)
+
+    async def _release_local_lease_with_lock(path: Path) -> None:
+        async with archive_write_lock(archive):
+            await asyncio.to_thread(_write_local_release, path)
+
+    lease_path: Optional[Path] = None
+    artifact_dir = Path(settings.storage.root).expanduser().resolve() / "projects" / slug / "artifacts" / agent_name / branch
     env = os.environ.copy()
     env.update({
         "AM_SLOT": slot,
@@ -3251,16 +4086,18 @@ def am_run(
         "BRANCH": branch,
         "AGENT": agent_name,
         "CACHE_KEY": f"am-cache-{project_uid}-{agent_name}-{branch}",
+        "ARTIFACT_DIR": str(artifact_dir),
     })
-    # lease_path may already be set by eager creation above
     renew_stop = threading.Event()
     renew_thread: Optional[threading.Thread] = None
+    resolved_registration_token = registration_token
+    slot_acquired = False
     try:
         if worktrees_enabled:
             # Prefer server tools (authority); fallback to local FS leases
             use_server = True
             try:
-                with httpx.Client(timeout=5.0) as client:
+                with httpx.Client(timeout=server_request_timeout_seconds) as client:
                     headers = {}
                     if bearer:
                         headers["Authorization"] = f"Bearer {bearer}"
@@ -3270,14 +4107,22 @@ def am_run(
                         "method": "tools/call",
                         "params": {"name": "ensure_project", "arguments": {"human_key": str(p)}},
                     }
-                    client.post(server_url, json=req, headers=headers)
-            except Exception:
+                    resp = client.post(server_url, json=req, headers=headers)
+                    _parse_jsonrpc_response(resp, request_name="am-run ensure_project")
+            except httpx.TransportError:
                 use_server = False
 
             if use_server:
+                if not resolved_registration_token:
+                    resolved_registration_token = _run_async(_lookup_agent_registration_token(str(p), agent_name))
+                if not resolved_registration_token:
+                    raise click.ClickException(
+                        "am-run requires a registered agent with a registration token when the server is reachable. "
+                        "Register the agent first, or pass --registration-token / $AGENT_MAIL_REGISTRATION_TOKEN."
+                    )
                 conflicts: list[dict[str, Any]] = []
                 try:
-                    with httpx.Client(timeout=5.0) as client:
+                    with httpx.Client(timeout=server_request_timeout_seconds) as client:
                         headers = {}
                         if bearer:
                             headers["Authorization"] = f"Bearer {bearer}"
@@ -3291,16 +4136,18 @@ def am_run(
                                     "project_key": str(p),
                                     "agent_name": agent_name,
                                     "slot": slot,
-                                    "ttl_seconds": int(ttl_seconds),
+                                    "branch": branch or None,
+                                    "ttl_seconds": effective_ttl_seconds,
                                     "exclusive": (not shared),
+                                    "registration_token": resolved_registration_token,
                                 },
                             },
                         }
                         resp = client.post(server_url, json=req, headers=headers)
-                        data = resp.json()
-                        result = (data or {}).get("result") or {}
+                        result = _parse_jsonrpc_response(resp, request_name="am-run acquire_build_slot") or {}
                         conflicts = list(result.get("conflicts") or [])
-                except Exception:
+                        slot_acquired = True
+                except httpx.TransportError:
                     use_server = False
 
                 if conflicts and guard_mode == "warn":
@@ -3310,15 +4157,16 @@ def am_run(
                             f"  - slot={c.get('slot','')} agent={c.get('agent','')} "
                             f"branch={c.get('branch','')} expires={c.get('expires_ts','')}"
                         )
-                if conflicts and (not shared) and block_on_conflicts:
+                if conflicts and block_on_conflicts:
                     console.print("[red]Build slot conflicts detected and --block-on-conflicts set; aborting.[/]")
                     raise typer.Exit(code=1)
 
+                lease_path = _lease_path(_run_async(_ensure_slot_paths()))
+
                 def _renewer_srv() -> None:
-                    interval = max(60, ttl_seconds // 2)
-                    while not renew_stop.wait(interval):
+                    while not renew_stop.wait(renew_interval_seconds):
                         try:
-                            with httpx.Client(timeout=5.0) as client:
+                            with httpx.Client(timeout=server_request_timeout_seconds) as client:
                                 headers = {}
                                 if bearer:
                                     headers["Authorization"] = f"Bearer {bearer}"
@@ -3332,24 +4180,24 @@ def am_run(
                                             "project_key": str(p),
                                             "agent_name": agent_name,
                                             "slot": slot,
-                                            "extend_seconds": max(60, ttl_seconds // 2),
+                                            "branch": branch or None,
+                                            "extend_seconds": effective_ttl_seconds,
+                                            "registration_token": resolved_registration_token,
                                         },
                                     },
                                 }
-                                client.post(server_url, json=req, headers=headers)
+                                resp = client.post(server_url, json=req, headers=headers)
+                                _parse_jsonrpc_response(resp, request_name="am-run renew_build_slot")
                         except Exception:
+                            if lease_path:
+                                _run_async(_renew_local_lease_with_lock(lease_path))
                             continue
 
                 renew_thread = threading.Thread(target=_renewer_srv, name="am-run-renew", daemon=True)
                 renew_thread.start()
 
             if not use_server:
-                slot_dir = _run_async(_ensure_slot_paths())
-                active = _read_active(slot_dir)
-                conflicts = [
-                    e for e in active
-                    if e.get("exclusive", True) and not shared and not (e.get("agent") == agent_name and e.get("branch") == branch)
-                ]
+                conflicts, lease_path, _payload = _run_async(_acquire_local_lease_with_lock())
                 if conflicts and guard_mode == "warn":
                     console.print("[yellow]Build slot conflicts (advisory, proceeding):[/]")
                     for c in conflicts:
@@ -3357,34 +4205,16 @@ def am_run(
                             f"  - slot={c.get('slot','')} agent={c.get('agent','')} "
                             f"branch={c.get('branch','')} expires={c.get('expires_ts','')}"
                         )
-                if conflicts and (not shared) and block_on_conflicts:
+                if conflicts and block_on_conflicts:
                     console.print("[red]Build slot conflicts detected and --block-on-conflicts set; aborting.[/]")
                     raise typer.Exit(code=1)
-                lease_path = _lease_path(slot_dir)
-                payload = {
-                    "slot": slot,
-                    "agent": agent_name,
-                    "branch": branch,
-                    "exclusive": (not shared),
-                    "acquired_ts": datetime.now(timezone.utc).isoformat(),
-                    "expires_ts": (datetime.now(timezone.utc) + timedelta(seconds=ttl_seconds)).isoformat(),
-                }
-                with suppress(Exception):
-                    lease_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+                slot_acquired = True
 
                 def _renewer() -> None:
-                    interval = max(60, ttl_seconds // 2)
-                    while not renew_stop.wait(interval):
+                    while not renew_stop.wait(renew_interval_seconds):
                         try:
-                            now = datetime.now(timezone.utc)
-                            new_exp = now + timedelta(seconds=max(60, ttl_seconds // 2))
-                            try:
-                                current = json.loads(lease_path.read_text(encoding="utf-8")) if lease_path else {}
-                            except Exception:
-                                current = {}
-                            current.update({"expires_ts": new_exp.isoformat()})
                             if lease_path:
-                                lease_path.write_text(json.dumps(current, indent=2), encoding="utf-8")
+                                _run_async(_renew_local_lease_with_lock(lease_path))
                         except Exception:
                             continue
                 renew_thread = threading.Thread(target=_renewer, name="am-run-renew", daemon=True)
@@ -3394,10 +4224,13 @@ def am_run(
     except FileNotFoundError:
         rc = 127
     finally:
-        if worktrees_enabled:
+        if worktrees_enabled and slot_acquired:
+            renew_stop.set()
+            if renew_thread and renew_thread.is_alive():
+                renew_thread.join(timeout=server_request_timeout_seconds + 1.0)
             # Attempt server release; fallback to local lease release
             try:
-                with httpx.Client(timeout=5.0) as client:
+                with httpx.Client(timeout=server_request_timeout_seconds) as client:
                     headers = {}
                     if bearer:
                         headers["Authorization"] = f"Bearer {bearer}"
@@ -3407,27 +4240,21 @@ def am_run(
                         "method": "tools/call",
                         "params": {
                             "name": "release_build_slot",
-                            "arguments": {"project_key": str(p), "agent_name": agent_name, "slot": slot},
+                            "arguments": {
+                                "project_key": str(p),
+                                "agent_name": agent_name,
+                                "slot": slot,
+                                "branch": branch or None,
+                                "registration_token": resolved_registration_token,
+                            },
                         },
                     }
-                    client.post(server_url, json=req, headers=headers)
+                    resp = client.post(server_url, json=req, headers=headers)
+                    _parse_jsonrpc_response(resp, request_name="am-run release_build_slot")
             except Exception:
                 if lease_path:
-                    try:
-                        now = datetime.now(timezone.utc)
-                        try:
-                            data = json.loads(lease_path.read_text(encoding="utf-8"))
-                        except Exception:
-                            data = {}
-                        data.update({"released_ts": now.isoformat(), "expires_ts": now.isoformat()})
-                        with suppress(Exception):
-                            lease_path.write_text(json.dumps(data, indent=2), encoding="utf-8")
-                    except Exception:
-                        pass
-            finally:
-                renew_stop.set()
-                if renew_thread and renew_thread.is_alive():
-                    renew_thread.join(timeout=1.0)
+                    with suppress(Exception):
+                        _run_async(_release_local_lease_with_lock(lease_path))
     if rc != 0:
         raise typer.Exit(code=rc)
 
@@ -3439,31 +4266,24 @@ def projects_mark_identity(
     """
     Write the current project_uid into a marker file (.agent-mail-project-id).
     """
-    p = project_path.expanduser().resolve()
+    p = _canonical_project_path(project_path)
+    root = _resolve_repo_worktree_root(p)
     from mcp_agent_mail.app import _resolve_project_identity as _resolve_ident
-    ident = _resolve_ident(str(p))
+    ident = _resolve_ident(str(root))
     uid = ident.get("project_uid") or ""
     if not uid:
         raise typer.BadParameter("Unable to resolve project_uid for this path.")
-    # Determine repo root
-    repo = None
-    try:
-        from git import Repo as _Repo
-        repo = _Repo(str(p), search_parent_directories=True)
-        root = Path(repo.working_tree_dir or str(p))
-    except Exception:
-        root = p
-    finally:
-        if repo is not None:
-            with suppress(Exception):
-                repo.close()
     marker_path = root / ".agent-mail-project-id"
+    marker_rel = marker_path.relative_to(root).as_posix()
     marker_path.write_text(uid + "\n", encoding="utf-8")
     console.print(f"[green]Wrote[/] {marker_path} with project_uid={uid}")
     if commit:
         try:
-            subprocess.run(["git", "-C", str(root), "add", str(marker_path)], check=True)
-            subprocess.run(["git", "-C", str(root), "commit", "-m", "chore: add .agent-mail-project-id"], check=True)
+            subprocess.run(["git", "-C", str(root), "add", "--", marker_rel], check=True)
+            subprocess.run(
+                ["git", "-C", str(root), "commit", "-m", "chore: add .agent-mail-project-id", "--", marker_rel],
+                check=True,
+            )
             console.print("[green]Committed marker file.[/]")
         except Exception:
             console.print("[yellow]Unable to commit marker automatically. Please commit manually.[/]")
@@ -3477,18 +4297,28 @@ def projects_discovery_init(
     """
     Scaffold a discovery YAML file (.agent-mail.yaml) with project_uid (and optional product_uid).
     """
-    p = project_path.expanduser().resolve()
+    settings = get_settings()
+    p = _canonical_project_path(project_path)
+    root = _resolve_repo_worktree_root(p)
     from mcp_agent_mail.app import _resolve_project_identity as _resolve_ident
-    ident = _resolve_ident(str(p))
+    ident = _resolve_ident(str(root))
     uid = ident.get("project_uid") or ""
     if not uid:
         raise typer.BadParameter("Unable to resolve project_uid for this path.")
-    ypath = p / ".agent-mail.yaml"
+    ypath = root / ".agent-mail.yaml"
     lines = ["# Agent Mail discovery file", f"project_uid: {uid}"]
     if product:
         lines.append(f"product_uid: {product}")
     ypath.write_text("\n".join(lines) + "\n", encoding="utf-8")
     console.print(f"[green]Wrote[/] {ypath}")
+    # The discovery YAML is only consulted by identity resolution when
+    # WORKTREES_ENABLED=1; otherwise it is inert. Make that explicit so users
+    # aren't left with a file that silently does nothing. (#208)
+    if not settings.worktrees_enabled:
+        console.print(
+            "[yellow]Note:[/] WORKTREES_ENABLED is not set, so this discovery file is currently "
+            "inert. Set WORKTREES_ENABLED=1 for it to take effect."
+        )
 @mail_app.command("status")
 def mail_status(
     project_path: Annotated[
@@ -3501,72 +4331,27 @@ def mail_status(
     and the slug that would be used for this path.
     """
     settings = get_settings()
-    p = project_path.expanduser().resolve()
+    p = _resolve_repo_worktree_root(_canonical_project_path(project_path))
     gate = settings.worktrees_enabled
     mode = (settings.project_identity_mode or "dir").strip().lower()
     remote_name = (settings.project_identity_remote or "origin").strip()
+    from mcp_agent_mail.app import _resolve_project_identity as _resolve_ident
+    ident = _resolve_ident(str(p))
+    normalized_remote = ident.get("normalized_remote")
+    slug_value = ident["slug"]
 
-    def _norm_remote(url: Optional[str]) -> Optional[str]:
-        if not url:
-            return None
-        u = url.strip()
-        try:
-            if u.startswith("git@"):
-                host = u.split("@", 1)[1].split(":", 1)[0]
-                path = u.split(":", 1)[1]
-            else:
-                from urllib.parse import urlparse as _urlparse
-                pr = _urlparse(u)
-                host = pr.hostname or ""
-                path = (pr.path or "")
-        except Exception:
-            return None
-        if not host:
-            return None
-        path = path.lstrip("/")
-        if path.endswith(".git"):
-            path = path[:-4]
-        parts = [seg for seg in path.split("/") if seg]
-        if len(parts) < 2:
-            return None
-        owner, repo = parts[0], parts[1]
-        return f"{host}/{owner}/{repo}"
-
-    normalized_remote: Optional[str] = None
-    repo = None
-    try:
-        from git import Repo as _Repo  # local import to avoid CLI startup cost
-        repo = _Repo(str(p), search_parent_directories=True)
-        try:
-            url = repo.git.remote("get-url", remote_name).strip() or None
-        except Exception:
-            try:
-                r = next((r for r in repo.remotes if r.name == remote_name), None)
-                url = next(iter(r.urls), None) if r and r.urls else None
-            except Exception:
-                url = None
-        normalized_remote = _norm_remote(url)
-    except Exception:
-        normalized_remote = None
-    finally:
-        if repo is not None:
-            with suppress(Exception):
-                repo.close()
-
-    # Compute a candidate slug using the same logic as the server helper (summarized)
-    from mcp_agent_mail.app import _compute_project_slug as _compute_slug
-    slug_value = _compute_slug(str(p))
-
-    table = Table(title="Mail routing status", show_lines=False)
+    table = Table(title="Mail routing status", show_lines=False, expand=True)
     table.add_column("Field")
-    table.add_column("Value")
+    table.add_column("Value", overflow="fold")
     table.add_row("WORKTREES_ENABLED", "true" if gate else "false")
     table.add_row("PROJECT_IDENTITY_MODE", mode or "dir")
     table.add_row("PROJECT_IDENTITY_REMOTE", remote_name)
     table.add_row("normalized_remote", normalized_remote or "")
     table.add_row("slug", slug_value)
-    table.add_row("path", str(p))
+    table.add_row("path", ident["human_key"])
     console.print(table)
+    typer.echo(f"slug={slug_value}")
+    typer.echo(f"path={ident['human_key']}")
 
 
 @guard_app.command("status")
@@ -3832,27 +4617,94 @@ def projects_adopt(
         # Move Git artifacts
         settings = get_settings()
         # local import to minimize top-level churn and keep ordering stable
-        from .storage import AsyncFileLock as _AsyncFileLock, ensure_archive as _ensure_archive
-        src_archive = _run_async(_ensure_archive(settings, src.slug))
-        dst_archive = _run_async(_ensure_archive(settings, dst.slug))
-        moved_relpaths: list[str] = []
-        for path_item in sorted(src_archive.root.rglob("*"), key=str):
-            # rglob returns Path objects at runtime; cast for type checker
-            path = cast(Path, path_item)
-            if not path.is_file():
-                continue
-            if path.name.endswith(".lock") or path.name.endswith(".lock.owner.json"):
-                continue
-            rel_from_root = path.relative_to(src_archive.root)
-            dest_path = dst_archive.root / rel_from_root
-            await asyncio.to_thread(dest_path.parent.mkdir, parents=True, exist_ok=True)
-            if dest_path.exists():
-                continue
-            await asyncio.to_thread(path.replace, dest_path)
-            moved_relpaths.append(dest_path.relative_to(dst_archive.repo_root).as_posix())
-        from .storage import _commit as _archive_commit
-        async with _AsyncFileLock(dst_archive.lock_path):
-            await _archive_commit(dst_archive.repo, settings, f"adopt: move {src.slug} into {dst.slug}", moved_relpaths)
+        from git import Actor
+
+        from .storage import (
+            AsyncFileLock as _AsyncFileLock,
+            _commit as _archive_commit,
+            _commit_lock_path as _commit_lock_path,
+        )
+
+        async def _commit_archive_move(
+            *,
+            add_relpaths: Sequence[str],
+            remove_relpaths: Sequence[str],
+            message: str,
+        ) -> None:
+            combined_relpaths = [*remove_relpaths, *add_relpaths]
+            if not combined_relpaths:
+                return
+            actor = Actor(settings.storage.git_author_name, settings.storage.git_author_email)
+            commit_lock_path = _commit_lock_path(dst_archive.repo_root, combined_relpaths)
+            async with _AsyncFileLock(commit_lock_path):
+                if remove_relpaths:
+                    await asyncio.to_thread(
+                        dst_archive.repo.git.rm,
+                        "--cached",
+                        "--ignore-unmatch",
+                        "--",
+                        *remove_relpaths,
+                    )
+                if add_relpaths:
+                    await asyncio.to_thread(dst_archive.repo.index.add, list(add_relpaths))
+                if await asyncio.to_thread(dst_archive.repo.is_dirty, index=True, working_tree=True):
+                    await asyncio.to_thread(
+                        dst_archive.repo.index.commit,
+                        message,
+                        author=actor,
+                        committer=actor,
+                    )
+
+        lock_order = tuple(sorted((src_archive, dst_archive), key=lambda archive: str(archive.lock_path)))
+        async with archive_write_lock(lock_order[0]), archive_write_lock(lock_order[1]):
+            move_candidates: list[tuple[Path, Path]] = []
+            collisions: list[str] = []
+            for path_item in sorted(src_archive.root.rglob("*"), key=str):
+                # rglob returns Path objects at runtime; cast for type checker
+                path = cast(Path, path_item)
+                if not path.is_file():
+                    continue
+                if path.name.endswith(".lock") or path.name.endswith(".lock.owner.json"):
+                    continue
+                rel_from_root = path.relative_to(src_archive.root)
+                dest_path = dst_archive.root / rel_from_root
+                if await asyncio.to_thread(dest_path.exists):
+                    collisions.append(rel_from_root.as_posix())
+                    continue
+                move_candidates.append((path, dest_path))
+            if collisions:
+                preview = ", ".join(collisions[:5])
+                suffix = f" (+{len(collisions) - 5} more)" if len(collisions) > 5 else ""
+                raise typer.BadParameter(f"Target archive already contains conflicting paths: {preview}{suffix}")
+
+            moved_relpaths: list[str] = []
+            removed_relpaths: list[str] = []
+            for source_path, dest_path in move_candidates:
+                await asyncio.to_thread(dest_path.parent.mkdir, parents=True, exist_ok=True)
+                await asyncio.to_thread(source_path.replace, dest_path)
+                moved_relpaths.append(dest_path.relative_to(dst_archive.repo_root).as_posix())
+                removed_relpaths.append(source_path.relative_to(src_archive.repo_root).as_posix())
+
+            await _commit_archive_move(
+                add_relpaths=moved_relpaths,
+                remove_relpaths=removed_relpaths,
+                message=f"adopt: move {src.slug} into {dst.slug}",
+            )
+
+            # Write aliases.json under target while the same archive surfaces stay locked.
+            aliases_path = dst_archive.root / "aliases.json"
+            try:
+                existing: dict[str, Any] = {}
+                if await asyncio.to_thread(aliases_path.exists):
+                    existing = json.loads(await asyncio.to_thread(aliases_path.read_text, encoding="utf-8"))
+                former = set(existing.get("former_slugs", []))
+                former.add(src.slug)
+                existing["former_slugs"] = sorted(former)
+                await asyncio.to_thread(aliases_path.write_text, json.dumps(existing, indent=2), "utf-8")
+                rel_alias = aliases_path.relative_to(dst_archive.repo_root).as_posix()
+                await _archive_commit(dst_archive.repo, settings, f"adopt: record alias for {src.slug}", [rel_alias])
+            except Exception as exc:
+                console.print(f"[yellow]Warning: failed to write aliases.json: {exc}[/]")
         # Re-key database rows (agents, messages, file_reservations)
         async with get_session() as session:
             from sqlalchemy import update as _update  # local import to avoid top-of-file churn
@@ -3860,20 +4712,6 @@ def projects_adopt(
             await session.execute(_update(Message).where(cast(ColumnElement[bool], Message.project_id == src.id)).values(project_id=dst.id))
             await session.execute(_update(FileReservation).where(cast(ColumnElement[bool], FileReservation.project_id == src.id)).values(project_id=dst.id))
             await session.commit()
-        # Write aliases.json under target
-        aliases_path = dst_archive.root / "aliases.json"
-        try:
-            existing = {}
-            if aliases_path.exists():
-                existing = json.loads(aliases_path.read_text(encoding="utf-8"))
-            former = set(existing.get("former_slugs", []))
-            former.add(src.slug)
-            existing["former_slugs"] = sorted(former)
-            await asyncio.to_thread(aliases_path.write_text, json.dumps(existing, indent=2), "utf-8")
-            rel_alias = aliases_path.relative_to(dst_archive.repo_root).as_posix()
-            await _archive_commit(dst_archive.repo, settings, f"adopt: record alias for {src.slug}", [rel_alias])
-        except Exception as exc:
-            console.print(f"[yellow]Warning: failed to write aliases.json: {exc}[/]")
 
     try:
         _run_async(_apply())
@@ -4351,6 +5189,7 @@ def config_set_port(
         console.print(f"[red]Error:[/red] Failed to write {env_path}: {e}")
         raise typer.Exit(code=1) from e
 
+    clear_settings_cache()
     console.print("\n[dim]Note: Restart the server for changes to take effect[/dim]")
 
 
@@ -4602,6 +5441,12 @@ class DiagnosticResult:
     repair_available: bool = False
 
 
+async def _resolve_doctor_project(project_identifier: str | None) -> Project | None:
+    if not project_identifier:
+        return None
+    return await _get_project_record(project_identifier)
+
+
 @doctor_app.command("check")
 def doctor_check(
     project: Annotated[
@@ -4627,12 +5472,19 @@ def doctor_check(
         settings = get_settings()
         await ensure_schema()
         results: list[DiagnosticResult] = []
+        project_record = await _resolve_doctor_project(project)
+        project_id = project_record.id if project_record is not None else None
+        project_slug = project_record.slug if project_record is not None else None
 
         # Check 1: Stale locks
         from .storage import collect_lock_status
 
-        lock_status = collect_lock_status(settings)
-        stale_locks = lock_status.get("stale_locks", [])
+        lock_status = collect_lock_status(settings, project_slug=project_slug)
+        stale_locks = [
+            cast(str, lock.get("path"))
+            for lock in lock_status.get("locks", [])
+            if lock.get("stale_suspected") and isinstance(lock.get("path"), str)
+        ]
         if stale_locks:
             results.append(DiagnosticResult(
                 name="Locks",
@@ -4688,11 +5540,21 @@ def doctor_check(
         # Check 3: Orphaned records
         async with get_session() as session:
             # Count orphaned message recipients (no agent)
-            orphan_query = text("""
-                SELECT COUNT(*) FROM message_recipients mr
-                WHERE NOT EXISTS (SELECT 1 FROM agents a WHERE a.id = mr.agent_id)
-            """)
-            result = await session.execute(orphan_query)
+            if project_id is None:
+                orphan_query = text("""
+                    SELECT COUNT(*) FROM message_recipients mr
+                    WHERE NOT EXISTS (SELECT 1 FROM agents a WHERE a.id = mr.agent_id)
+                """)
+                result = await session.execute(orphan_query)
+            else:
+                orphan_query = text("""
+                    SELECT COUNT(*)
+                    FROM message_recipients mr
+                    JOIN messages m ON m.id = mr.message_id
+                    WHERE m.project_id = :pid
+                    AND NOT EXISTS (SELECT 1 FROM agents a WHERE a.id = mr.agent_id)
+                """)
+                result = await session.execute(orphan_query, {"pid": project_id})
             orphan_count = result.scalar() or 0
             if orphan_count > 0:
                 results.append(DiagnosticResult(
@@ -4709,12 +5571,25 @@ def doctor_check(
                 ))
 
             # Check 4: FTS index consistency
-            fts_query = text("""
-                SELECT
-                    (SELECT COUNT(*) FROM messages) as msg_count,
-                    (SELECT COUNT(*) FROM fts_messages) as fts_count
-            """)
-            result = await session.execute(fts_query)
+            if project_id is None:
+                fts_query = text("""
+                    SELECT
+                        (SELECT COUNT(*) FROM messages) as msg_count,
+                        (SELECT COUNT(*) FROM fts_messages) as fts_count
+                """)
+                result = await session.execute(fts_query)
+            else:
+                fts_query = text("""
+                    SELECT
+                        (SELECT COUNT(*) FROM messages WHERE project_id = :pid) as msg_count,
+                        (
+                            SELECT COUNT(*)
+                            FROM fts_messages
+                            JOIN messages m ON m.id = fts_messages.rowid
+                            WHERE m.project_id = :pid
+                        ) as fts_count
+                """)
+                result = await session.execute(fts_query, {"pid": project_id})
             counts = result.fetchone()
             if counts:
                 msg_count, fts_count = counts
@@ -4735,12 +5610,13 @@ def doctor_check(
             # Check 5: Expired file reservations
             # Use naive UTC datetime for consistency with how FileReservation stores timestamps
             now = datetime.now(timezone.utc).replace(tzinfo=None)
-            expired_query = select(func.count()).select_from(FileReservation).where(
-                and_(
-                    cast(ColumnElement[bool], cast(Any, FileReservation.released_ts).is_(None)),
-                    cast(ColumnElement[bool], cast(Any, FileReservation.expires_ts) < now),
-                )
-            )
+            expired_conditions = [
+                cast(ColumnElement[bool], cast(Any, FileReservation.released_ts).is_(None)),
+                cast(ColumnElement[bool], cast(Any, FileReservation.expires_ts) < now),
+            ]
+            if project_id is not None:
+                expired_conditions.append(cast(ColumnElement[bool], FileReservation.project_id == project_id))
+            expired_query = select(func.count()).select_from(FileReservation).where(and_(*expired_conditions))
             result = await session.execute(expired_query)
             expired_count = result.scalar() or 0
             if expired_count > 0:
@@ -4759,8 +5635,7 @@ def doctor_check(
 
         # Check 6: WAL/journal files
         if db_path and db_path.exists():
-            wal_path = db_path.with_suffix(".sqlite3-wal")
-            shm_path = db_path.with_suffix(".sqlite3-shm")
+            wal_path, shm_path = get_sqlite_sidecar_paths(db_path)
             orphan_files: list[str] = []
             if wal_path.exists():
                 orphan_files.append(str(wal_path))
@@ -4873,7 +5748,7 @@ def doctor_repair(
     - Auto-fixes safe issues: stale locks, expired file reservations
     - Prompts for confirmation on data-affecting repairs
 
-    Creates a backup before any destructive operation.
+    Creates a backup before any destructive operation and aborts if backup creation fails.
     """
 
     async def _run() -> dict[str, Any]:
@@ -4881,6 +5756,9 @@ def doctor_repair(
 
         settings = get_settings()
         await ensure_schema()
+        project_record = await _resolve_doctor_project(project)
+        project_id = project_record.id if project_record is not None else None
+        project_slug = project_record.slug if project_record is not None else None
         repair_results: dict[str, Any] = {
             "backup_path": None,
             "safe_repairs": [],
@@ -4894,17 +5772,13 @@ def doctor_repair(
             try:
                 backup_path = await create_diagnostic_backup(
                     settings,
-                    project_slug=project,
                     backup_dir=backup_dir,
                     reason="doctor-repair",
                 )
                 repair_results["backup_path"] = str(backup_path)
                 console.print(f"[green]Backup created:[/green] {backup_path}")
             except Exception as e:
-                repair_results["errors"].append(f"Backup failed: {e}")
-                console.print(f"[red]Backup failed:[/red] {e}")
-                if not yes and not typer.confirm("Continue without backup?", default=False):
-                    return repair_results
+                raise RuntimeError(f"Backup failed: {e}") from e
 
         # Step 2: Safe repairs (auto-applied)
         console.print("\n[bold]Safe Repairs (auto-applied):[/bold]")
@@ -4915,7 +5789,7 @@ def doctor_repair(
             repair_results["safe_repairs"].append({"action": "heal_locks", "dry_run": True})
         else:
             try:
-                lock_result = await heal_archive_locks(settings)
+                lock_result = await heal_archive_locks(settings, project_slug=project_slug)
                 healed = lock_result.get("healed", 0)
                 if healed > 0:
                     console.print(f"  [green]Healed {healed} stale lock(s)[/green]")
@@ -4930,13 +5804,14 @@ def doctor_repair(
         async with get_session() as session:
             # Use naive UTC datetime for consistency with how FileReservation stores timestamps
             now = datetime.now(timezone.utc).replace(tzinfo=None)
+            expired_conditions = [
+                cast(ColumnElement[bool], cast(Any, FileReservation.released_ts).is_(None)),
+                cast(ColumnElement[bool], cast(Any, FileReservation.expires_ts) < now),
+            ]
+            if project_id is not None:
+                expired_conditions.append(cast(ColumnElement[bool], FileReservation.project_id == project_id))
             if dry_run:
-                expired_query = select(func.count()).select_from(FileReservation).where(
-                    and_(
-                        cast(ColumnElement[bool], cast(Any, FileReservation.released_ts).is_(None)),
-                        cast(ColumnElement[bool], cast(Any, FileReservation.expires_ts) < now),
-                    )
-                )
+                expired_query = select(func.count()).select_from(FileReservation).where(and_(*expired_conditions))
                 result = await session.execute(expired_query)
                 count = result.scalar() or 0
                 console.print(f"  [dim]Would release {count} expired reservation(s)[/dim]")
@@ -4947,12 +5822,7 @@ def doctor_repair(
 
                 update_stmt = (
                     update(FileReservation)
-                    .where(
-                        and_(
-                            cast(ColumnElement[bool], cast(Any, FileReservation.released_ts).is_(None)),
-                            cast(ColumnElement[bool], cast(Any, FileReservation.expires_ts) < now),
-                        )
-                    )
+                    .where(and_(*expired_conditions))
                     .values(released_ts=now)
                 )
                 result = await session.execute(update_stmt)
@@ -4969,11 +5839,21 @@ def doctor_repair(
 
         # 3a: Clean orphaned message recipients
         async with get_session() as session:
-            orphan_count_query = text("""
-                SELECT COUNT(*) FROM message_recipients mr
-                WHERE NOT EXISTS (SELECT 1 FROM agents a WHERE a.id = mr.agent_id)
-            """)
-            result = await session.execute(orphan_count_query)
+            if project_id is None:
+                orphan_count_query = text("""
+                    SELECT COUNT(*) FROM message_recipients mr
+                    WHERE NOT EXISTS (SELECT 1 FROM agents a WHERE a.id = mr.agent_id)
+                """)
+                result = await session.execute(orphan_count_query)
+            else:
+                orphan_count_query = text("""
+                    SELECT COUNT(*)
+                    FROM message_recipients mr
+                    JOIN messages m ON m.id = mr.message_id
+                    WHERE m.project_id = :pid
+                    AND NOT EXISTS (SELECT 1 FROM agents a WHERE a.id = mr.agent_id)
+                """)
+                result = await session.execute(orphan_count_query, {"pid": project_id})
             orphan_count = result.scalar() or 0
 
             if orphan_count > 0:
@@ -4981,11 +5861,21 @@ def doctor_repair(
                     console.print(f"  [dim]Would delete {orphan_count} orphaned recipient record(s)[/dim]")
                     repair_results["data_repairs"].append({"action": "delete_orphans", "count": orphan_count, "dry_run": True})
                 elif yes or typer.confirm(f"  Delete {orphan_count} orphaned message recipient record(s)?", default=False):
-                    delete_query = text("""
-                        DELETE FROM message_recipients
-                        WHERE NOT EXISTS (SELECT 1 FROM agents a WHERE a.id = message_recipients.agent_id)
-                    """)
-                    await session.execute(delete_query)
+                    if project_id is None:
+                        delete_query = text("""
+                            DELETE FROM message_recipients
+                            WHERE NOT EXISTS (SELECT 1 FROM agents a WHERE a.id = message_recipients.agent_id)
+                        """)
+                        await session.execute(delete_query)
+                    else:
+                        delete_query = text("""
+                            DELETE FROM message_recipients
+                            WHERE message_id IN (
+                                SELECT m.id FROM messages m WHERE m.project_id = :pid
+                            )
+                            AND NOT EXISTS (SELECT 1 FROM agents a WHERE a.id = message_recipients.agent_id)
+                        """)
+                        await session.execute(delete_query, {"pid": project_id})
                     await session.commit()
                     console.print(f"  [green]Deleted {orphan_count} orphaned record(s)[/green]")
                     repair_results["data_repairs"].append({"action": "delete_orphans", "deleted": orphan_count})
@@ -5014,6 +5904,7 @@ def doctor_repair(
     console.print(f"  Data repairs: {data_count}")
     if error_count > 0:
         console.print(f"  [red]Errors: {error_count}[/red]")
+        raise typer.Exit(code=1)
 
 
 @doctor_app.command("backups")
@@ -5028,7 +5919,14 @@ def doctor_backups(
         settings = get_settings()
         return await list_backups(settings)
 
-    backups = _run_async(_run())
+    try:
+        backups = _run_async(_run())
+    except Exception as exc:
+        if json_output:
+            console.print_json(json.dumps({"error": str(exc)}))
+        else:
+            console.print(f"[red]Failed to list backups:[/] {exc}")
+        raise typer.Exit(code=1) from exc
 
     if json_output:
         console.print_json(json.dumps(backups))
@@ -5084,14 +5982,38 @@ def doctor_restore(
         raise typer.Exit(code=1)
 
     # Show backup info
-    with manifest_path.open() as f:
-        manifest = json.load(f)
+    try:
+        from .storage import _parse_backup_manifest, _resolve_backup_file_artifact
+
+        with manifest_path.open(encoding="utf-8") as f:
+            manifest = _parse_backup_manifest(json.load(f))
+        if manifest.database_path is not None:
+            try:
+                _resolve_backup_file_artifact(backup_path, manifest.database_path)
+            except FileNotFoundError as exc:
+                raise ValueError(
+                    f"manifest.json references missing artifact: {manifest.database_path}"
+                ) from exc
+            except IsADirectoryError as exc:
+                raise ValueError(
+                    f"manifest.json artifact is not a file: {manifest.database_path}"
+                ) from exc
+        for bundle_ref in manifest.project_bundles:
+            try:
+                _resolve_backup_file_artifact(backup_path, bundle_ref)
+            except FileNotFoundError as exc:
+                raise ValueError(f"manifest.json references missing artifact: {bundle_ref}") from exc
+            except IsADirectoryError as exc:
+                raise ValueError(f"manifest.json artifact is not a file: {bundle_ref}") from exc
+    except (OSError, ValueError, json.JSONDecodeError) as exc:
+        console.print(f"[red]Invalid backup manifest:[/red] {exc}")
+        raise typer.Exit(code=1) from exc
 
     console.print("\n[bold cyan]Restore from Backup[/bold cyan]")
-    console.print(f"  Created: {manifest.get('created_at', 'unknown')}")
-    console.print(f"  Reason: {manifest.get('reason', 'unknown')}")
-    console.print(f"  Has database: {'Yes' if manifest.get('database_path') else 'No'}")
-    console.print(f"  Bundles: {len(manifest.get('project_bundles', []))}")
+    console.print(f"  Created: {manifest.created_at}")
+    console.print(f"  Reason: {manifest.reason}")
+    console.print(f"  Has database: {'Yes' if manifest.database_path else 'No'}")
+    console.print(f"  Bundles: {len(manifest.project_bundles)}")
 
     if dry_run:
         console.print("\n[yellow]Dry run - no changes will be made[/yellow]")
@@ -5103,10 +6025,31 @@ def doctor_restore(
             return
 
     async def _run() -> dict[str, Any]:
-        from .storage import restore_from_backup
+        from .db import get_database_path
+        from .storage import create_diagnostic_backup, restore_from_backup
 
         settings = get_settings()
-        return await restore_from_backup(settings, backup_path, dry_run=dry_run)
+        if dry_run:
+            return await restore_from_backup(settings, backup_path, dry_run=True)
+
+        pre_restore_backup: Path | None = None
+        current_db_path = get_database_path(settings)
+        current_archive_root = await asyncio.to_thread(
+            lambda: Path(settings.storage.root).expanduser().resolve()
+        )
+        has_current_db = bool(
+            current_db_path and await asyncio.to_thread(current_db_path.exists)
+        )
+        has_current_archive = await asyncio.to_thread((current_archive_root / ".git").exists)
+
+        if has_current_db or has_current_archive:
+            pre_restore_backup = await create_diagnostic_backup(settings, reason="pre-restore")
+        restore_result = await restore_from_backup(settings, backup_path, dry_run=False)
+        if pre_restore_backup is not None:
+            restore_result["pre_restore_backup_path"] = str(pre_restore_backup)
+        else:
+            restore_result["pre_restore_backup_skipped_reason"] = "no current database or archive found"
+        return restore_result
 
     try:
         result = _run_async(_run())
@@ -5115,19 +6058,37 @@ def doctor_restore(
         raise typer.Exit(code=1) from exc
 
     if dry_run:
-        console.print("\n[bold]Would restore:[/bold]")
+        preview_errors = list(result.get("errors", []))
+        if preview_errors:
+            console.print("\n[bold red]Dry run found restore blockers:[/bold red]")
+        else:
+            console.print("\n[bold]Would restore:[/bold]")
         if result.get("would_restore_database"):
             console.print("  - Database")
         for bundle in result.get("would_restore_bundles", []):
             console.print(f"  - Bundle: {bundle}")
+        for error in preview_errors:
+            console.print(f"  [red]Error:[/red] {error}")
+        if preview_errors:
+            raise typer.Exit(code=1)
     else:
-        console.print("\n[bold]Restore complete:[/bold]")
+        restore_errors = list(result.get("errors", []))
+        if restore_errors:
+            console.print("\n[bold red]Restore completed with errors:[/bold red]")
+        else:
+            console.print("\n[bold]Restore complete:[/bold]")
+        if result.get("pre_restore_backup_path"):
+            console.print(f"  [cyan]Pre-restore backup:[/cyan] {result['pre_restore_backup_path']}")
+        elif result.get("pre_restore_backup_skipped_reason"):
+            console.print(f"  [dim]Pre-restore backup skipped:[/dim] {result['pre_restore_backup_skipped_reason']}")
         if result.get("database_restored"):
             console.print("  [green]Database restored[/green]")
         for bundle in result.get("bundles_restored", []):
             console.print(f"  [green]Bundle restored:[/green] {bundle}")
-        for error in result.get("errors", []):
+        for error in restore_errors:
             console.print(f"  [red]Error:[/red] {error}")
+        if restore_errors:
+            raise typer.Exit(code=1)
 
 
 if __name__ == "__main__":

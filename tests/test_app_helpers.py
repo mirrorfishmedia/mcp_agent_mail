@@ -1,7 +1,8 @@
 from __future__ import annotations
 
 import os
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
 from typing import cast
 
 import pytest
@@ -12,8 +13,10 @@ from mcp_agent_mail.app import (
     _enforce_capabilities,
     _iso,
     _latest_filesystem_activity,
+    _latest_git_activity,
     _parse_iso,
     _parse_json_safely,
+    _reservation_repo_pathspec,
     build_mcp_server,
 )
 
@@ -63,6 +66,86 @@ def test_latest_filesystem_activity_returns_max(tmp_path) -> None:
 
     assert latest is not None
     assert latest == datetime.fromtimestamp(new_ts, tz=timezone.utc)
+
+
+def test_latest_filesystem_activity_early_exits_on_recent(tmp_path) -> None:
+    # The sweeper only needs to know whether *any* match is recent; once a
+    # recent mtime is seen it must stop, not stat the rest of a 56k-file glob
+    # expansion on the event loop (#240). Prove the scan stops: the first file
+    # is recent (inside the grace window) but the second is *even more* recent.
+    # If the scan stopped at the first, the returned max is the first's mtime;
+    # if it kept going it would observe the larger second mtime instead.
+    now = datetime.now(timezone.utc)
+    first_recent = tmp_path / "a_first_recent.txt"
+    second_more_recent = tmp_path / "b_more_recent.txt"
+    first_recent.write_text("x", encoding="utf-8")
+    second_more_recent.write_text("y", encoding="utf-8")
+
+    first_ts = (now - timedelta(seconds=100)).timestamp()
+    second_ts = now.timestamp()
+    os.utime(first_recent, (first_ts, first_ts))
+    os.utime(second_more_recent, (second_ts, second_ts))
+    recent_after = now - timedelta(seconds=300)
+
+    latest = _latest_filesystem_activity(
+        [first_recent, second_more_recent], recent_after=recent_after
+    )
+
+    # Returned the first (recent) mtime, NOT the larger second one -> stopped early.
+    assert latest == datetime.fromtimestamp(first_ts, tz=timezone.utc)
+    assert latest < datetime.fromtimestamp(second_ts, tz=timezone.utc)
+
+    # And without a recent_after window it must still scan all and return the max.
+    assert _latest_filesystem_activity(
+        [first_recent, second_more_recent]
+    ) == datetime.fromtimestamp(second_ts, tz=timezone.utc)
+
+
+def test_reservation_repo_pathspec_glob_and_exact(tmp_path) -> None:
+    git = pytest.importorskip("git")
+    repo = git.Repo.init(tmp_path)
+    workspace = Path(tmp_path)
+
+    # Glob pattern -> single `:(glob)` magic pathspec (one rev walk, #240).
+    assert (
+        _reservation_repo_pathspec(repo, workspace, "frontend/**")
+        == ":(glob)frontend/**"
+    )
+    # Exact path -> plain repo-relative pathspec (no magic needed).
+    assert _reservation_repo_pathspec(repo, workspace, "README.md") == "README.md"
+    # Virtual namespaces have no git presence.
+    assert _reservation_repo_pathspec(repo, workspace, "tool://playwright") is None
+
+
+def test_latest_git_activity_single_glob_walk(tmp_path) -> None:
+    git = pytest.importorskip("git")
+    repo = git.Repo.init(tmp_path)
+
+    # Two files under a broad glob (one nested like node_modules), one outside.
+    (tmp_path / "frontend" / "deep" / "pkg").mkdir(parents=True)
+    (tmp_path / "frontend" / "a.js").write_text("1", encoding="utf-8")
+    (tmp_path / "frontend" / "deep" / "pkg" / "b.js").write_text("1", encoding="utf-8")
+    (tmp_path / "other.txt").write_text("1", encoding="utf-8")
+    repo.index.add(["frontend/a.js", "frontend/deep/pkg/b.js", "other.txt"])
+    tree_commit = repo.index.commit("init")
+
+    pathspec = _reservation_repo_pathspec(repo, Path(tmp_path), "frontend/**")
+    activity = _latest_git_activity(repo, pathspec)
+    assert activity is not None
+    assert activity == datetime.fromtimestamp(
+        tree_commit.committed_date, tz=timezone.utc
+    )
+
+    # A later commit touching ONLY a path outside the glob must not move the
+    # reported activity for `frontend/**` (semantic equivalence to per-file max).
+    import time
+
+    time.sleep(1.1)
+    (tmp_path / "other.txt").write_text("2", encoding="utf-8")
+    repo.index.add(["other.txt"])
+    repo.index.commit("touch other")
+    after = _latest_git_activity(repo, pathspec)
+    assert after == datetime.fromtimestamp(tree_commit.committed_date, tz=timezone.utc)
 
 
 @pytest.mark.asyncio

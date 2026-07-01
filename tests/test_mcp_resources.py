@@ -22,11 +22,15 @@ from __future__ import annotations
 
 import json
 from typing import Any
+from urllib.parse import quote
 
 import pytest
 from fastmcp import Client
+from sqlalchemy import delete
 
 from mcp_agent_mail.app import build_mcp_server
+from mcp_agent_mail.db import get_session
+from mcp_agent_mail.models import Agent
 
 # ============================================================================
 # Helper: Parse JSON from resource blocks
@@ -531,6 +535,127 @@ async def test_thread_resource_with_include_bodies(isolated_env):
         assert "body_md" in msg, "Should include body"
 
 
+@pytest.mark.asyncio
+async def test_thread_resource_only_returns_visible_messages(isolated_env):
+    """thread resource should hide private messages from non-participants."""
+    server = build_mcp_server()
+    async with Client(server) as bootstrap_client:
+        await bootstrap_client.call_tool("ensure_project", {"human_key": "/threadprivate"})
+        green = await bootstrap_client.call_tool(
+            "register_agent",
+            {"project_key": "ThreadPrivate", "program": "test", "model": "test", "name": "GreenCastle"},
+        )
+        blue = await bootstrap_client.call_tool(
+            "register_agent",
+            {"project_key": "ThreadPrivate", "program": "test", "model": "test", "name": "BlueLake"},
+        )
+        purple = await bootstrap_client.call_tool(
+            "register_agent",
+            {"project_key": "ThreadPrivate", "program": "test", "model": "test", "name": "PurpleBear"},
+        )
+        green_token = green.data["registration_token"]
+        blue_token = blue.data["registration_token"]
+        purple_token = purple.data["registration_token"]
+
+    async with Client(server) as sender_client:
+        await sender_client.call_tool(
+            "macro_contact_handshake",
+            {
+                "project_key": "ThreadPrivate",
+                "requester": "GreenCastle",
+                "target": "BlueLake",
+                "auto_accept": True,
+                "requester_registration_token": green_token,
+                "target_registration_token": blue_token,
+            },
+        )
+        await sender_client.call_tool(
+            "send_message",
+            {
+                "project_key": "ThreadPrivate",
+                "sender_name": "GreenCastle",
+                "sender_token": green_token,
+                "to": ["GreenCastle"],
+                "bcc": ["BlueLake"],
+                "subject": "Private thread",
+                "body_md": "Classified body",
+                "thread_id": "THREAD-PRIVATE-1",
+            },
+        )
+
+    async with Client(server) as outsider_client:
+        outsider_blocks = await outsider_client.read_resource(
+            "resource://thread/THREAD-PRIVATE-1"
+            f"?project=ThreadPrivate&agent=PurpleBear&agent_token={quote(purple_token)}&include_bodies=true"
+        )
+        outsider_data = parse_resource_json(outsider_blocks)
+        assert outsider_data["messages"] == []
+
+    async with Client(server) as bcc_client:
+        bcc_blocks = await bcc_client.read_resource(
+            "resource://thread/THREAD-PRIVATE-1"
+            f"?project=ThreadPrivate&agent=BlueLake&agent_token={quote(blue_token)}&include_bodies=true"
+        )
+        bcc_data = parse_resource_json(bcc_blocks)
+        assert len(bcc_data["messages"]) == 1
+        assert bcc_data["messages"][0]["subject"] == "Private thread"
+        assert bcc_data["messages"][0]["body_md"] == "Classified body"
+
+
+@pytest.mark.asyncio
+async def test_message_resource_requires_project(isolated_env):
+    """Message resource must require explicit project scoping."""
+    server = build_mcp_server()
+    async with Client(server) as client:
+        await client.call_tool("ensure_project", {"human_key": "/messagereq"})
+        agent_result = await client.call_tool(
+            "register_agent",
+            {"project_key": "MessageReq", "program": "test", "model": "test"},
+        )
+        agent_name = agent_result.data["name"]
+        result = await client.call_tool(
+            "send_message",
+            {
+                "project_key": "MessageReq",
+                "sender_name": agent_name,
+                "to": [agent_name],
+                "subject": "Needs project",
+                "body_md": "body",
+            },
+        )
+        message_id = (result.data.get("deliveries") or [{}])[0].get("payload", {}).get("id")
+
+        with pytest.raises(Exception, match="project"):
+            await client.read_resource(f"resource://message/{message_id}")
+
+
+@pytest.mark.asyncio
+async def test_thread_resource_requires_project(isolated_env):
+    """Thread resource must require explicit project scoping."""
+    server = build_mcp_server()
+    async with Client(server) as client:
+        await client.call_tool("ensure_project", {"human_key": "/threadreq"})
+        agent_result = await client.call_tool(
+            "register_agent",
+            {"project_key": "ThreadReq", "program": "test", "model": "test"},
+        )
+        agent_name = agent_result.data["name"]
+        await client.call_tool(
+            "send_message",
+            {
+                "project_key": "ThreadReq",
+                "sender_name": agent_name,
+                "to": [agent_name],
+                "subject": "Needs project",
+                "body_md": "body",
+                "thread_id": "THREAD-REQ-1",
+            },
+        )
+
+        with pytest.raises(Exception, match="project"):
+            await client.read_resource("resource://thread/THREAD-REQ-1")
+
+
 # ============================================================================
 # Test: resource://file_reservations/{project}
 # ============================================================================
@@ -634,6 +759,62 @@ async def test_file_reservations_resource_active_only(isolated_env):
 
 
 @pytest.mark.asyncio
+async def test_file_reservations_resource_defaults_to_active_only(isolated_env):
+    """resource://file_reservations/{project} should default to active reservations only."""
+    server = build_mcp_server()
+    async with Client(server) as client:
+        await client.call_tool("ensure_project", {"human_key": "/filedefaultactive"})
+
+        agent_result = await client.call_tool(
+            "register_agent",
+            {"project_key": "FileDefaultActive", "program": "test", "model": "test"},
+        )
+        agent_name = agent_result.data["name"]
+
+        await client.call_tool(
+            "file_reservation_paths",
+            {
+                "project_key": "FileDefaultActive",
+                "agent_name": agent_name,
+                "paths": ["released.py"],
+            },
+        )
+        await client.call_tool(
+            "release_file_reservations",
+            {
+                "project_key": "FileDefaultActive",
+                "agent_name": agent_name,
+                "paths": ["released.py"],
+            },
+        )
+        await client.call_tool(
+            "file_reservation_paths",
+            {
+                "project_key": "FileDefaultActive",
+                "agent_name": agent_name,
+                "paths": ["active.py"],
+            },
+        )
+
+        blocks = await client.read_resource("resource://file_reservations/filedefaultactive")
+        data = parse_resource_json(blocks)
+
+        assert data is not None
+        assert isinstance(data, list)
+        active_patterns = [r["path_pattern"] for r in data]
+        assert "active.py" in active_patterns
+        assert "released.py" not in active_patterns
+
+        all_blocks = await client.read_resource("resource://file_reservations/filedefaultactive?active_only=false")
+        all_data = parse_resource_json(all_blocks)
+
+        assert all_data is not None
+        all_patterns = [r["path_pattern"] for r in all_data]
+        assert "active.py" in all_patterns
+        assert "released.py" in all_patterns
+
+
+@pytest.mark.asyncio
 async def test_file_reservations_resource_includes_metadata(isolated_env):
     """File reservations resource includes stale status and timestamps."""
     server = build_mcp_server()
@@ -688,46 +869,99 @@ async def test_project_resource_nonexistent_returns_error(isolated_env):
 
 
 @pytest.mark.asyncio
-async def test_inbox_resource_requires_project(isolated_env):
-    """Inbox resource requires project parameter when agent is ambiguous."""
+@pytest.mark.parametrize(
+    "uri_template",
+    [
+        "resource://inbox/{agent}",
+        "resource://outbox/{agent}",
+        "resource://mailbox/{agent}",
+        "resource://mailbox-with-commits/{agent}",
+        "resource://views/urgent-unread/{agent}",
+        "resource://views/ack-required/{agent}",
+        "resource://views/acks-stale/{agent}",
+        "resource://views/ack-overdue/{agent}",
+    ],
+    ids=[
+        "inbox",
+        "outbox",
+        "mailbox",
+        "mailbox-with-commits",
+        "urgent-unread",
+        "ack-required",
+        "acks-stale",
+        "ack-overdue",
+    ],
+)
+async def test_agent_scoped_resources_require_project(isolated_env, uri_template: str):
+    """Agent-scoped resources must require explicit project scoping."""
     server = build_mcp_server()
     async with Client(server) as client:
-        # Create two projects with same agent name (using known-valid name)
-        await client.call_tool("ensure_project", {"human_key": "/proj1"})
-        await client.call_tool("ensure_project", {"human_key": "/proj2"})
-        await client.call_tool(
-            "register_agent",
-            {"project_key": "Proj1", "program": "test", "model": "test", "name": "BlueLake"},
-        )
-        await client.call_tool(
-            "register_agent",
-            {"project_key": "Proj2", "program": "test", "model": "test", "name": "BlueLake"},
-        )
-
-        try:
-            # Without project parameter, should fail or require clarification
-            await client.read_resource("resource://inbox/BlueLake")
-            # May succeed if auto-detection works, or fail
-        except Exception as e:
-            # Expected - ambiguous agent requires project
-            error_str = str(e).lower()
-            assert "project" in error_str or "required" in error_str or "ambiguous" in error_str
-
-
-@pytest.mark.asyncio
-async def test_outbox_resource_requires_project(isolated_env):
-    """Outbox resource requires project parameter."""
-    server = build_mcp_server()
-    async with Client(server) as client:
-        await client.call_tool("ensure_project", {"human_key": "/outboxreq"})
+        await client.call_tool("ensure_project", {"human_key": "/project-required"})
         agent_result = await client.call_tool(
             "register_agent",
-            {"project_key": "OutboxReq", "program": "test", "model": "test"},
+            {"project_key": "project-required", "program": "test", "model": "test"},
         )
         agent_name = agent_result.data["name"]
 
-        try:
-            await client.read_resource(f"resource://outbox/{agent_name}")
-            pytest.fail("Should require project parameter")
-        except Exception as e:
-            assert "project" in str(e).lower()
+        with pytest.raises(Exception, match="project"):
+            await client.read_resource(uri_template.format(agent=agent_name))
+
+
+# When an Agent row is deleted out from under an outstanding FileReservation
+# (manual hygiene, project rotation, test reset), the reservation must still
+# be discoverable so the staleness sweeper can release it. Before #161 the
+# INNER JOIN dropped these rows from the listing entirely, leaving the path
+# pinned forever. (#161)
+@pytest.mark.asyncio
+async def test_file_reservations_resource_surfaces_orphaned(isolated_env):
+    server = build_mcp_server()
+    async with Client(server) as client:
+        await client.call_tool("ensure_project", {"human_key": "/orphan"})
+        agent_result = await client.call_tool(
+            "register_agent",
+            {"project_key": "orphan", "program": "test", "model": "test"},
+        )
+        agent_name = agent_result.data["name"]
+
+        await client.call_tool(
+            "file_reservation_paths",
+            {
+                "project_key": "orphan",
+                "agent_name": agent_name,
+                "paths": ["src/orphan_target.py"],
+            },
+        )
+
+        # Delete the owning agent row out-of-band — mimics the operational
+        # condition the issue describes.
+        async with get_session() as session:
+            await session.execute(delete(Agent).where(Agent.name == agent_name))
+            await session.commit()
+
+        # Orphaned reservations are stale=True by definition, so the resource
+        # endpoint auto-releases them via `_expire_stale_file_reservations`
+        # before serving the listing. That's the desired behavior — orphans
+        # no longer pin the path. To inspect the post-release record we have
+        # to ask for the full (released-inclusive) listing.
+        blocks = await client.read_resource(
+            "resource://file_reservations/orphan?active_only=false"
+        )
+        data = parse_resource_json(blocks)
+        assert isinstance(data, list), f"expected list payload, got {type(data).__name__}"
+        orphans = [r for r in data if r.get("path_pattern") == "src/orphan_target.py"]
+        assert len(orphans) == 1, (
+            f"orphaned reservation must still be listed (released, not dropped); got {data!r}"
+        )
+        orphan = orphans[0]
+        # agent name is None (the row is gone), but the original agent_id is
+        # preserved for forensics — same row stays available for sweepers.
+        assert orphan.get("agent") is None, f"orphan agent must be null, got {orphan!r}"
+        assert orphan.get("agent_id") is not None, (
+            "agent_id must still carry the deleted agent's id for forensics"
+        )
+        assert "agent_unresolved" in (orphan.get("stale_reasons") or []), (
+            f"expected agent_unresolved stale reason, got {orphan.get('stale_reasons')!r}"
+        )
+        assert orphan.get("released_ts") is not None, (
+            "orphaned reservation must have been auto-released by the sweep"
+        )

@@ -25,7 +25,10 @@ import os
 import random
 import re
 import sys
+import threading as _threading
 import time
+import weakref
+from collections.abc import Mapping
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -38,11 +41,33 @@ from git.objects.tree import Tree
 from PIL import Image
 
 from .config import Settings
+from .db import get_sqlite_pre_restore_path, get_sqlite_sidecar_paths
 from .utils import validate_thread_id_format
 
 _logger = logging.getLogger(__name__)
 _IMAGE_PATTERN = re.compile(r"!\[(?P<alt>[^\]]*)\]\((?P<path>[^)]+)\)")
 _SUBJECT_SLUG_RE = re.compile(r"[^a-zA-Z0-9._-]+")
+
+
+def _sanitize_backup_reason(reason: str) -> str:
+    """Normalize a backup reason into a filesystem-safe path segment."""
+    sanitized = _SUBJECT_SLUG_RE.sub("-", reason.strip()).strip("-._")
+    return sanitized or "backup"
+
+
+def _create_unique_backup_dir(backup_dir: Path, reason: str) -> Path:
+    """Create a unique backup directory without timestamp collisions."""
+    timestamp = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H-%M-%S-%f")
+    base_name = f"{timestamp}_{_sanitize_backup_reason(reason)}"
+    suffix = 0
+    while True:
+        candidate_name = base_name if suffix == 0 else f"{base_name}_{suffix}"
+        candidate = backup_dir / candidate_name
+        try:
+            candidate.mkdir(parents=True, exist_ok=False)
+            return candidate
+        except FileExistsError:
+            suffix += 1
 
 
 # =============================================================================
@@ -115,7 +140,7 @@ class _CommitQueue:
 
     async def start(self) -> None:
         """Start the background queue processor."""
-        if self._task is not None:
+        if self._task is not None and not self._task.done():
             return
         self._stopped = False
         self._task = asyncio.create_task(self._process_loop())
@@ -172,7 +197,7 @@ class _CommitQueue:
         self._enqueued += 1
 
         # If queue processor isn't running, fall back to direct commit
-        if self._task is None or self._task.done():
+        if self._stopped or self._task is None or self._task.done():
             await _commit_direct(repo_root, settings, message, rel_paths)
             return
 
@@ -189,7 +214,7 @@ class _CommitQueue:
 
     async def _process_loop(self) -> None:
         """Background loop that processes queued commits."""
-        while not self._stopped:
+        while True:
             try:
                 # Wait for first request with timeout
                 try:
@@ -198,10 +223,14 @@ class _CommitQueue:
                         timeout=self._max_wait_ms / 1000.0,
                     )
                 except asyncio.TimeoutError:
+                    if self._stopped and self._queue.empty():
+                        return
                     continue
 
                 # Skip sentinel requests
                 if first.settings is None:
+                    if self._stopped and self._queue.empty():
+                        return
                     continue
 
                 # Collect more requests if available (non-blocking)
@@ -220,10 +249,25 @@ class _CommitQueue:
 
                 # Process the batch
                 await self._process_batch(batch)
+                if self._stopped and self._queue.empty():
+                    return
 
             except Exception as e:
                 _logger.exception("commit_queue.error", extra={"error": str(e)})
+                if self._stopped and self._queue.empty():
+                    return
                 await asyncio.sleep(0.1)  # Back off on errors
+
+    @staticmethod
+    def _finish_request(request: _CommitRequest, error: Exception | None = None) -> None:
+        """Settle a queued request unless its waiter has already gone away."""
+        future = request.future
+        if future.done():
+            return
+        if error is None:
+            future.set_result(None)
+        else:
+            future.set_exception(error)
 
     async def _process_batch(self, batch: list[_CommitRequest]) -> None:
         """Process a batch of commit requests.
@@ -248,10 +292,10 @@ class _CommitQueue:
                 req = requests[0]
                 try:
                     await _commit_direct(req.repo_root, req.settings, req.message, req.rel_paths)
-                    req.future.set_result(None)
+                    self._finish_request(req)
                     self._commits += 1
                 except Exception as e:
-                    req.future.set_exception(e)
+                    self._finish_request(req, e)
             else:
                 # Multiple requests to same repo - try to batch if no path conflicts
                 all_paths: set[str] = set()
@@ -283,7 +327,7 @@ class _CommitQueue:
                             merged_paths,
                         )
                         for req in requests:
-                            req.future.set_result(None)
+                            self._finish_request(req)
                         self._commits += 1
                         # Record batch size
                         self._batch_sizes.append(len(requests))
@@ -291,16 +335,16 @@ class _CommitQueue:
                             self._batch_sizes.pop(0)
                     except Exception as e:
                         for req in requests:
-                            req.future.set_exception(e)
+                            self._finish_request(req, e)
                 else:
                     # Process sequentially (conflicts or large batch)
                     for req in requests:
                         try:
                             await _commit_direct(req.repo_root, req.settings, req.message, req.rel_paths)
-                            req.future.set_result(None)
+                            self._finish_request(req)
                             self._commits += 1
                         except Exception as e:
-                            req.future.set_exception(e)
+                            self._finish_request(req, e)
 
 
 # Global commit queue instance (lazily initialized)
@@ -319,10 +363,10 @@ def _get_commit_queue_lock() -> asyncio.Lock:
 async def _get_commit_queue() -> _CommitQueue:
     """Get or create the global commit queue."""
     global _COMMIT_QUEUE
-    if _COMMIT_QUEUE is not None:
+    if _COMMIT_QUEUE is not None and _COMMIT_QUEUE._task is not None and not _COMMIT_QUEUE._task.done():
         return _COMMIT_QUEUE
     async with _get_commit_queue_lock():
-        if _COMMIT_QUEUE is None:
+        if _COMMIT_QUEUE is None or _COMMIT_QUEUE._task is None or _COMMIT_QUEUE._task.done():
             _COMMIT_QUEUE = _CommitQueue()
             await _COMMIT_QUEUE.start()
         return _COMMIT_QUEUE
@@ -354,6 +398,412 @@ class ProjectArchive:
 
 _PROCESS_LOCKS: dict[tuple[int, str], asyncio.Lock] = {}
 _PROCESS_LOCK_OWNERS: dict[tuple[int, str], int] = {}
+
+# ---------------------------------------------------------------------------
+# Lock-FD telemetry: track active AsyncFileLock instances for leak detection
+# ---------------------------------------------------------------------------
+# WeakValueDictionary (NOT a plain dict): the telemetry registry must not keep
+# instances alive. A plain `dict[int, AsyncFileLock]` strong-refs every lock, so
+# each refcount stays >= 1 and the `__del__` that pops the entry can never fire —
+# entries accumulate unboundedly (observed 560 active_locks at idle, #244). With
+# weak values the GC reclaims released locks normally and the entry drops
+# automatically; `__del__`'s `pop(id(self), None)` becomes a harmless no-op.
+# (CPython fires weakref callbacks synchronously on dealloc, before an id can be
+# reused, so the id-keyed mapping has no stale-entry race.)
+_ACTIVE_LOCK_INSTANCES: "weakref.WeakValueDictionary[int, AsyncFileLock]" = (
+    weakref.WeakValueDictionary()
+)  # id(lock) -> lock
+_LOCK_INSTANCES_GUARD = _threading.Lock()
+_LOCK_FD_LEAKED_TOTAL: int = 0  # monotonic counter of detected leaks
+
+
+def get_lock_telemetry() -> dict[str, int]:
+    """Return current lock-FD telemetry for monitoring."""
+    with _LOCK_INSTANCES_GUARD:
+        return {
+            "active_locks": len(_ACTIVE_LOCK_INSTANCES),
+            "leaked_total": _LOCK_FD_LEAKED_TOTAL,
+        }
+
+
+# macOS ``fcntl`` command for resolving an open fd to its path. Entries under
+# ``/dev/fd`` on Darwin are ``fdesc`` character devices (NOT symlinks), so
+# ``os.readlink`` raises EINVAL there; ``fcntl(fd, F_GETPATH, buf)`` is the
+# portable lookup. Python's ``fcntl`` module doesn't always expose F_GETPATH
+# symbolically, so fall back to the stable value from ``<sys/fcntl.h>`` (50).
+# MAXPATHLEN on macOS is 1024; lockfile paths inside the mail archive are far
+# shorter, so a 1024-byte buffer never truncates a real lock path.
+_DARWIN_MAXPATHLEN = 1024
+
+
+def _resolve_fd_path(fd_num: int, proc_entry: Path) -> str | None:
+    """Resolve an open file descriptor to its filesystem path.
+
+    On macOS uses ``fcntl(F_GETPATH)`` (``/dev/fd`` entries are char devices,
+    not symlinks); on Linux reads the ``/proc/self/fd/N`` symlink. Returns
+    ``None`` when the lookup fails (fd closed concurrently, not path-backed,
+    etc.).
+    """
+    try:
+        if sys.platform == "darwin":
+            import fcntl
+
+            f_getpath = getattr(fcntl, "F_GETPATH", 50)
+            raw = fcntl.fcntl(fd_num, f_getpath, b"\x00" * _DARWIN_MAXPATHLEN)
+            return raw.split(b"\x00", 1)[0].decode("utf-8", errors="replace")
+        return str(proc_entry.readlink())
+    except OSError:
+        return None
+
+
+def cleanup_leaked_lockfile_fds() -> int:
+    """Scan the process's open FDs for ones pointing at deleted ``.lock`` files and close them.
+
+    Returns the number of leaked FDs that were closed.
+
+    Cross-platform: walks ``/dev/fd`` on macOS (fdesc fs — entries are
+    character devices, not symlinks, so paths are resolved via
+    ``fcntl(F_GETPATH)``) and ``/proc/self/fd`` on Linux. Symmetric with
+    ``get_fd_usage`` above. The "deleted file" signal is
+    ``os.fstat(fd).st_nlink == 0`` on both platforms — a still-open fd whose
+    underlying inode has zero remaining hard links. That subsumes the
+    Linux-only ``" (deleted)"`` readlink suffix the previous implementation
+    relied on, and is the only signal that works on macOS at all (where the
+    function was previously a silent no-op because it only checked
+    ``/proc/self/fd``).
+
+    Without this dispatch, the ``AsyncFileLock`` lockfile-fd leak (issue #116)
+    accumulates unbounded on macOS until the process hits ``RLIMIT_NOFILE`` and
+    every subsequent ``send_message``/``reply_message`` fails with EMFILE.
+    """
+    fd_dir = Path("/dev/fd") if sys.platform == "darwin" else Path("/proc/self/fd")
+    if not fd_dir.exists():
+        return 0
+    closed = 0
+    try:
+        for entry in fd_dir.iterdir():
+            try:
+                fd_num = int(entry.name)
+            except ValueError:
+                continue
+            path = _resolve_fd_path(fd_num, entry)
+            # Cheap name filter before the fstat syscall: only ever reap fds
+            # that look like our advisory lock files.  Anchor on the basename
+            # so that unrelated paths containing ".lock" as a substring (e.g.
+            # ``/tmp/.lockfile-fooXYZ``, ``/var/log/log.locked-archive``) are
+            # never matched.  All AsyncFileLock paths this project creates end
+            # with ``.lock`` (e.g. ``.archive.lock``, ``.commit.lock``,
+            # ``<thread>.md.lock``).  The ``".lock." in base`` branch is
+            # currently dead code — no production path uses that naming — but
+            # is kept as a defensive guard against future ``.lock.<suffix>``
+            # patterns (e.g. a hypothetical ``.archive.lock.bak`` backup file)
+            # that might be introduced later without updating this filter.
+            # On Linux, /proc/self/fd symlinks for deleted inodes carry a
+            # " (deleted)" suffix — strip it before basename extraction so the
+            # ".lock" ending is visible.
+            if not path:
+                continue
+            clean_path = path.removesuffix(" (deleted)")
+            base = Path(clean_path).name
+            if not (base.endswith(".lock") or ".lock." in base):
+                continue
+            # Cross-platform "deleted" signal: a still-open fd whose inode has
+            # zero remaining hard links. A live, on-disk lockfile has
+            # st_nlink >= 1 and is left untouched.
+            try:
+                if os.fstat(fd_num).st_nlink != 0:
+                    continue
+            except OSError:
+                continue
+            try:
+                os.close(fd_num)
+                closed += 1
+                _logger.warning(
+                    "lockfile_fd.leaked_closed",
+                    extra={"fd": fd_num, "target": path},
+                )
+            except OSError:
+                pass
+    except OSError:
+        pass
+    if closed:
+        global _LOCK_FD_LEAKED_TOTAL
+        with _LOCK_INSTANCES_GUARD:
+            _LOCK_FD_LEAKED_TOTAL += closed
+    return closed
+
+
+class _LRURepoCache:
+    """LRU cache for Git Repo objects with size limit.
+
+    This prevents file descriptor leaks by:
+    1. Limiting the number of cached repos (default: 16)
+    2. Evicting oldest repos when at capacity
+    3. Closing evicted repos after a grace period (time-based, not refcount-based)
+
+    IMPORTANT: Evicted repos are NOT closed immediately because they may still be in use
+    by other coroutines. They are given a grace period (default 60s) before being closed.
+    Cleanup runs opportunistically on both get() and put() operations.
+    """
+
+    # Grace period in seconds before evicted repos are forcibly closed.
+    # This replaces the unreliable sys.getrefcount() heuristic which created
+    # phantom references from iteration, locals, and stack frames, causing
+    # evicted repos to accumulate indefinitely and leak file descriptors.
+    EVICTION_GRACE_SECONDS: float = 60.0
+
+    def __init__(self, maxsize: int = 16) -> None:
+        self._maxsize = max(1, maxsize)
+        self._cache: dict[str, Repo] = {}
+        self._order: list[str] = []  # LRU order: oldest first
+        self._evicted: list[tuple[Repo, float]] = []  # (repo, eviction_timestamp) pairs
+        self._cleanup_counter: int = 0  # Track operations for periodic cleanup
+
+    def peek(self, key: str) -> Repo | None:
+        """Check if key exists and return value WITHOUT updating LRU order.
+
+        Safe to call without holding the external lock for a fast-path check.
+        """
+        return self._cache.get(key)
+
+    def get(self, key: str) -> Repo | None:
+        """Get a repo from cache, updating LRU order.
+
+        Should only be called while holding the external lock.
+        Also performs opportunistic cleanup of evicted repos.
+        """
+        if key in self._cache:
+            # Move to end (most recently used)
+            with contextlib.suppress(ValueError):
+                self._order.remove(key)
+            self._order.append(key)
+            # Opportunistically try to clean up evicted repos every 4th access
+            self._cleanup_counter += 1
+            if self._cleanup_counter >= 4:
+                self._cleanup_counter = 0
+                self._cleanup_evicted()
+            return self._cache[key]
+        return None
+
+    def put(self, key: str, repo: Repo) -> None:
+        """Add a repo to cache, evicting oldest if at capacity.
+
+        Should only be called while holding the external lock.
+        Evicted repos are added to a pending list for later cleanup.
+
+        Note: If the key already exists, only the LRU order is updated;
+        the cached repo value is NOT replaced. This is intentional since
+        the cache is only used by _ensure_repo which checks existence first.
+        """
+        if key in self._cache:
+            # Already exists, just update LRU order
+            with contextlib.suppress(ValueError):
+                self._order.remove(key)
+            self._order.append(key)
+            return
+
+        # Evict oldest entries if at capacity
+        while len(self._cache) >= self._maxsize and self._order:
+            oldest_key = self._order.pop(0)
+            old_repo = self._cache.pop(oldest_key, None)
+            if old_repo is not None:
+                # Don't close immediately - repo may still be in use by another coroutine
+                # Record eviction time for time-based cleanup
+                self._evicted.append((old_repo, time.monotonic()))
+
+        self._cache[key] = repo
+        self._order.append(key)
+
+        # Opportunistically try to close evicted repos that are no longer referenced
+        self._cleanup_evicted()
+
+    def _cleanup_evicted(self, *, force: bool = False) -> int:
+        """Close evicted repos whose grace period has expired.
+
+        Uses a time-based approach: repos are closed after EVICTION_GRACE_SECONDS
+        have elapsed since eviction. This replaces the previous sys.getrefcount()
+        heuristic which was unreliable -- Python refcounting creates phantom
+        references from iteration, locals, and frames, causing evicted repos to
+        accumulate indefinitely and leak file descriptors.
+
+        Args:
+            force: If True, close ALL evicted repos regardless of age (used
+                   during emergency FD cleanup).
+
+        Returns count of repos closed. Logs warning if evicted list grows large.
+        """
+        still_pending: list[tuple[Repo, float]] = []
+        closed = 0
+        now = time.monotonic()
+        for repo, evicted_at in self._evicted:
+            age = now - evicted_at
+            if force or age >= self.EVICTION_GRACE_SECONDS:
+                with contextlib.suppress(Exception):
+                    repo.close()
+                    closed += 1
+            else:
+                still_pending.append((repo, evicted_at))
+        self._evicted = still_pending
+        # Warn if evicted list is growing large (potential file handle pressure)
+        if len(still_pending) > self._maxsize:
+            _logger.warning(
+                "repo_cache.evicted_backlog",
+                extra={"evicted_count": len(still_pending), "maxsize": self._maxsize},
+            )
+        return closed
+
+    @property
+    def evicted_count(self) -> int:
+        """Number of evicted repos waiting to be closed."""
+        return len(self._evicted)
+
+    @property
+    def stats(self) -> dict[str, int]:
+        """Return cache statistics for monitoring."""
+        return {
+            "cached": len(self._cache),
+            "evicted": len(self._evicted),
+            "maxsize": self._maxsize,
+        }
+
+    def __contains__(self, key: str) -> bool:
+        return key in self._cache
+
+    def __len__(self) -> int:
+        return len(self._cache)
+
+    def clear(self) -> int:
+        """Close all cached and evicted repos and clear the cache. Returns count closed."""
+        count = 0
+        # Close cached repos
+        for repo in self._cache.values():
+            with contextlib.suppress(Exception):
+                repo.close()
+                count += 1
+        self._cache.clear()
+        self._order.clear()
+        # Also close any evicted repos still in pending list
+        for repo, _evicted_at in self._evicted:
+            with contextlib.suppress(Exception):
+                repo.close()
+                count += 1
+        self._evicted.clear()
+        return count
+
+    def values(self) -> list[Repo]:
+        """Return list of cached repos (for iteration)."""
+        return list(self._cache.values())
+
+
+# LRU cache for Repo objects with automatic cleanup
+# Limits to 16 concurrent repos to prevent file handle exhaustion under heavy load
+# Increased from 8 to handle multi-project scenarios better (GitHub issue #59)
+_REPO_CACHE: _LRURepoCache = _LRURepoCache()  # Uses default maxsize=16
+_REPO_CACHE_LOCK: asyncio.Lock | None = None
+
+# Semaphore to limit concurrent repo operations (prevents FD exhaustion under high concurrency)
+# This acts as a second line of defense beyond the LRU cache
+_REPO_SEMAPHORE: asyncio.Semaphore | None = None
+_REPO_SEMAPHORE_LIMIT: int = 32  # Max concurrent repo operations
+
+
+def _get_repo_cache_lock() -> asyncio.Lock:
+    """Get or create the repo cache lock (must be called from async context)."""
+    global _REPO_CACHE_LOCK
+    if _REPO_CACHE_LOCK is None:
+        _REPO_CACHE_LOCK = asyncio.Lock()
+    return _REPO_CACHE_LOCK
+
+
+def _get_repo_semaphore() -> asyncio.Semaphore:
+    """Get or create the repo semaphore (must be called from async context)."""
+    global _REPO_SEMAPHORE
+    if _REPO_SEMAPHORE is None:
+        _REPO_SEMAPHORE = asyncio.Semaphore(_REPO_SEMAPHORE_LIMIT)
+    return _REPO_SEMAPHORE
+
+
+def get_fd_usage() -> tuple[int, int]:
+    """Get current and maximum file descriptor counts.
+
+    Returns (current_count, max_limit) tuple.
+    On platforms where this isn't available, returns (-1, -1).
+    """
+    try:
+        import resource
+        soft_limit, _hard_limit = resource.getrlimit(resource.RLIMIT_NOFILE)
+        # Count open file descriptors by checking /proc/self/fd (Linux) or /dev/fd (macOS)
+        fd_dir = Path("/dev/fd") if sys.platform == "darwin" else Path("/proc/self/fd")
+        if fd_dir.exists():
+            current = len(list(fd_dir.iterdir()))
+            return (current, soft_limit)
+        return (-1, soft_limit)
+    except (ImportError, OSError, AttributeError):
+        return (-1, -1)
+
+
+def get_fd_headroom() -> int:
+    """Get remaining file descriptor headroom before hitting the limit.
+
+    Returns -1 if unable to determine.
+    """
+    current, limit = get_fd_usage()
+    if current < 0 or limit < 0:
+        return -1
+    return max(0, limit - current)
+
+
+def proactive_fd_cleanup(*, threshold: int = 100) -> int:
+    """Proactively cleanup resources if file descriptor headroom is low.
+
+    Handles two classes of leaked FDs:
+    1. Repo-cache FDs (git Repo objects held too long)
+    2. Lockfile FDs (leaked by AsyncFileLock on release failure / cancellation)
+
+    Args:
+        threshold: Minimum headroom required; cleanup runs if below this.
+
+    Returns:
+        Number of resources freed (0 if no cleanup needed or unable to check).
+    """
+    headroom = get_fd_headroom()
+    if headroom < 0:
+        # Can't determine headroom, skip cleanup
+        return 0
+    if headroom >= threshold:
+        # Sufficient headroom, no cleanup needed
+        return 0
+    # Low headroom - force cleanup of ALL evicted repos (bypass grace period)
+    freed = _REPO_CACHE._cleanup_evicted(force=True)
+
+    # Clean up leaked lockfile FDs (deleted .lock files still held open)
+    lock_fds_closed = cleanup_leaked_lockfile_fds()
+    freed += lock_fds_closed
+
+    # If still low, clear some cached repos too
+    new_headroom = get_fd_headroom()
+    if new_headroom >= 0 and new_headroom < threshold // 2:
+        # Critical: clear all cached repos
+        freed += _REPO_CACHE.clear()
+    return freed
+
+
+def clear_repo_cache() -> int:
+    """Close all cached Repo objects and clear the cache.
+
+    Returns the number of repos that were closed.
+    Should be called during shutdown or between tests.
+    """
+    return _REPO_CACHE.clear()
+
+
+def get_repo_cache_stats() -> dict[str, int]:
+    """Get repository cache statistics for monitoring.
+
+    Returns dict with 'cached', 'evicted', and 'maxsize' counts.
+    Useful for diagnosing file handle pressure.
+    """
+    return _REPO_CACHE.stats
 
 
 class _LRURepoCache:
@@ -646,7 +1096,19 @@ class AsyncFileLock:
         max_retries: int = 5,
     ) -> None:
         self._path = Path(path)
-        self._lock = SoftFileLock(str(self._path))
+        # thread_local=False is REQUIRED for correctness. We drive acquire()
+        # and release() through ``asyncio.to_thread`` (the default executor),
+        # so a single logical lock lifetime is spread across *different* worker
+        # threads. With filelock's default ``thread_local=True`` the underlying
+        # fd + lock_counter live in a per-thread context: an acquire on worker
+        # thread A and a release on worker thread B then disagree — thread B
+        # sees ``is_locked == False`` and ``release()`` becomes a silent no-op,
+        # leaving the fd open and the ``.lock``/``.commit.lock`` file on disk
+        # forever. The next writer blocks on a lock held by the still-alive
+        # server process and hangs indefinitely (issue #166; also feeds the
+        # leaked-fd accumulation tracked by #116). A shared (process-wide)
+        # context makes cross-thread acquire/release consistent and portable.
+        self._lock = SoftFileLock(str(self._path), thread_local=False)
         self._timeout = float(timeout_seconds)
         self._stale_timeout = float(max(stale_timeout_seconds, 0.0))
         self._max_retries = max_retries
@@ -659,6 +1121,72 @@ class AsyncFileLock:
         self._loop_key: tuple[int, str] | None = None
         self._process_lock: asyncio.Lock | None = None
         self._process_lock_held = False
+        # Register for telemetry
+        with _LOCK_INSTANCES_GUARD:
+            _ACTIVE_LOCK_INSTANCES[id(self)] = self
+
+    def __del__(self) -> None:
+        lock_instances_guard = globals().get("_LOCK_INSTANCES_GUARD")
+        active_lock_instances = globals().get("_ACTIVE_LOCK_INSTANCES")
+        if lock_instances_guard is None or active_lock_instances is None:
+            return
+        try:
+            with lock_instances_guard:
+                active_lock_instances.pop(id(self), None)
+        except Exception:
+            return
+
+    def _force_close_fd(self) -> bool:
+        """Force-close the underlying SoftFileLock file descriptor if still open.
+
+        This is the last-resort safety net: if ``release()`` raised or was
+        interrupted, the FD may still be open and pointing at a (possibly
+        deleted) lock file.  We reach into the SoftFileLock internals to
+        close it, preventing FD exhaustion.
+
+        Returns True if an FD was actually closed, False otherwise.
+        """
+        fd = getattr(self._lock, "_context", None)
+        if fd is None:
+            return False
+        lock_fd = getattr(fd, "lock_file_fd", None)
+        if lock_fd is None:
+            return False
+        try:
+            os.close(lock_fd)
+            fd.lock_file_fd = None
+            fd.lock_counter = 0
+            _logger.warning(
+                "lockfile_fd.force_closed",
+                extra={"path": str(self._path), "fd": lock_fd},
+            )
+            global _LOCK_FD_LEAKED_TOTAL
+            with _LOCK_INSTANCES_GUARD:
+                _LOCK_FD_LEAKED_TOTAL += 1
+            return True
+        except OSError:
+            # FD was already closed (e.g., by a concurrent cleanup)
+            fd.lock_file_fd = None
+            fd.lock_counter = 0
+            return False
+
+    def _release_strict(self) -> bool:
+        """Release the lock, ensuring the FD is closed even on failure.
+
+        Returns True if the lock was successfully released (FD closed).
+        If ``release()`` raises, falls back to ``_force_close_fd()``.
+        """
+        try:
+            self._lock.release()
+            return True
+        except Exception as exc:
+            _logger.error(
+                "lockfile_fd.release_failed",
+                extra={"path": str(self._path), "error": str(exc)},
+            )
+            # Fallback: force-close the FD to prevent leak
+            self._force_close_fd()
+            return False
 
     async def __aenter__(self) -> None:
         """Acquire the file lock with adaptive retry and stale lock detection.
@@ -776,13 +1304,22 @@ class AsyncFileLock:
             # Best-effort cleanup on any failure (including cancellation) to avoid leaking
             # lock file handles and process-level locks.
             if self._held:
-                task = asyncio.create_task(_to_thread(self._lock.release))
+                release_ok = False
+                task = asyncio.create_task(_to_thread(self._release_strict))
                 try:
-                    await asyncio.shield(task)
+                    release_ok = await asyncio.shield(task)
                 except BaseException:
                     with contextlib.suppress(Exception):
-                        await task
+                        release_ok = await task
+                if not release_ok:
+                    # release_strict already force-closed the FD; force-close
+                    # again as a safety net (idempotent)
+                    await _to_thread(self._force_close_fd)
                 self._held = False
+                # Only unlink files if we confirmed the FD is closed (release
+                # succeeded or was force-closed).  This prevents unlinking a
+                # lock path while another process may have legitimately
+                # acquired it in between.
                 for cleanup_coro in (
                     _to_thread(self._metadata_path.unlink, missing_ok=True),
                     _to_thread(self._path.unlink, missing_ok=True),
@@ -812,10 +1349,12 @@ class AsyncFileLock:
         """Remove lock and metadata when the lock is stale.
 
         A lock is considered stale if EITHER:
-        1. The owning process no longer exists, OR
+        1. Owner metadata proves the owning process no longer exists, OR
         2. The lock age exceeds the stale timeout
 
-        This ensures locks are cleaned up promptly when either condition is met.
+        Missing owner metadata by itself is not enough to declare the lock stale,
+        because there is a small window between acquiring the lock file and
+        writing the sidecar metadata.
         """
         if not self._path.exists():
             return False
@@ -831,7 +1370,9 @@ class AsyncFileLock:
         if pid_val is not None:
             with contextlib.suppress(Exception):
                 pid_int = int(pid_val)
-        owner_alive = self._pid_alive(pid_int) if pid_int else False
+        owner_alive: bool | None = None
+        if pid_int is not None:
+            owner_alive = self._pid_alive(pid_int)
         created_ts = metadata.get("created_ts")
         age = None
         if isinstance(created_ts, (int, float)):
@@ -840,15 +1381,10 @@ class AsyncFileLock:
             with contextlib.suppress(Exception):
                 age = now - self._path.stat().st_mtime
 
-        # Lock is stale if EITHER the owner is dead OR the age exceeds timeout
-        # Special case: if stale_timeout is 0, only check owner liveness (ignore age)
+        # Lock is stale if owner metadata proves the owner is gone OR if the
+        # lock file itself has aged beyond the configured stale timeout.
         is_stale = False
-        if not owner_alive:
-            # Owner process is dead - lock is stale regardless of age
-            is_stale = True
-        elif self._stale_timeout > 0 and isinstance(age, (int, float)) and age >= self._stale_timeout:
-            # Lock is too old - stale regardless of owner status
-            # (only if stale_timeout > 0, otherwise age check is disabled)
+        if owner_alive is False or (self._stale_timeout > 0 and isinstance(age, (int, float)) and age >= self._stale_timeout):
             is_stale = True
 
         if not is_stale:
@@ -871,17 +1407,31 @@ class AsyncFileLock:
 
     async def __aexit__(self, exc_type: type[BaseException] | None, exc: BaseException | None, tb: object) -> None:
         if self._held:
-            # Release/unlink must be cancellation-safe; otherwise cancelled tasks can leak
-            # lock file handles and wedge subsequent operations.
-            for cleanup_coro in (
-                _to_thread(self._lock.release),
-                asyncio.sleep(0.01) if sys.platform == "win32" else None,
-                _to_thread(self._metadata_path.unlink, missing_ok=True),
-                _to_thread(self._path.unlink, missing_ok=True),
-            ):
-                if cleanup_coro is None:
-                    continue
-                task = asyncio.create_task(cleanup_coro)
+            # Step 1: Release the lock (closes FD + unlinks lock file internally).
+            # Use _release_strict so that if release() raises, the FD is still
+            # force-closed, preventing the leaked-FD exhaustion bug (#116).
+            release_ok = False
+            release_task = asyncio.create_task(_to_thread(self._release_strict))
+            try:
+                release_ok = await asyncio.shield(release_task)
+            except BaseException:
+                with contextlib.suppress(Exception):
+                    release_ok = await release_task
+            if not release_ok:
+                # Last resort: ensure FD is closed even if everything above failed
+                await _to_thread(self._force_close_fd)
+
+            # Step 2: Windows needs a short delay after close before unlink
+            if sys.platform == "win32":
+                await asyncio.sleep(0.01)
+
+            # Step 3: Clean up metadata file.  The lock file itself is already
+            # unlinked by SoftFileLock._release(); we only need to remove the
+            # metadata sidecar.  Redundant unlink of self._path is safe (missing_ok).
+            for cleanup_path in (self._metadata_path, self._path):
+                task = asyncio.create_task(
+                    _to_thread(cleanup_path.unlink, missing_ok=True)
+                )
                 try:
                     await asyncio.shield(task)
                 except BaseException:
@@ -951,13 +1501,23 @@ class AsyncFileLock:
 
 @asynccontextmanager
 async def archive_write_lock(archive: ProjectArchive, *, timeout_seconds: float = 60.0) -> AsyncIterator[None]:
-    """Context manager for safely mutating archive surfaces."""
+    """Context manager for safely mutating archive surfaces.
+
+    The lock is released in a ``finally`` no matter how the body terminates —
+    normal return, exception, or task cancellation/timeout. Acquisition is kept
+    inside the same ``try`` so that a cancellation delivered at the await
+    boundary *after* ``__aenter__`` returns (but before the body runs) still
+    routes through release; ``__aexit__`` is a no-op when nothing was acquired
+    (``_held`` stays False and no process lock is held), so the unconditional
+    finally is safe. This guarantees ``.archive.lock`` is never left wedged on
+    disk after an interrupted write (issue #166).
+    """
     lock = AsyncFileLock(archive.lock_path, timeout_seconds=timeout_seconds)
-    await lock.__aenter__()
     exc_type: type[BaseException] | None = None
     exc: BaseException | None = None
     tb: object | None = None
     try:
+        await lock.__aenter__()
         yield
     except BaseException as raised:
         exc_type = type(raised)
@@ -980,6 +1540,51 @@ async def _to_thread(func: Any, /, *args: Any, **kwargs: Any) -> Any:
     return await asyncio.to_thread(func, *args, **kwargs)
 
 
+def _expanduser_resolve_path(path: Path) -> Path:
+    return path.expanduser().resolve()
+
+
+def _resolve_path(path: Path) -> Path:
+    return path.resolve()
+
+
+def _path_exists(path: Path) -> bool:
+    return path.exists()
+
+
+def _list_rglob_paths(root: Path, pattern: str) -> list[Path]:
+    return list(root.rglob(pattern))
+
+
+def _restore_bundle_into_archive(bundle_to_restore: Path, target_root: Path) -> None:
+    """Restore a Git bundle into the archive root without deleting the source bundle first."""
+    import shutil
+    import tempfile
+
+    clear_repo_cache()
+    source_bundle = bundle_to_restore
+    try:
+        resolved_source = bundle_to_restore.resolve()
+        resolved_target = target_root.resolve()
+        if resolved_source.is_relative_to(resolved_target):
+            with tempfile.TemporaryDirectory(prefix="mcp-agent-mail-restore-") as temp_dir_str:
+                staged_bundle = Path(temp_dir_str) / bundle_to_restore.name
+                shutil.copy2(bundle_to_restore, staged_bundle)
+                _restore_bundle_into_archive(staged_bundle, target_root)
+            return
+    except Exception:
+        source_bundle = bundle_to_restore
+
+    if target_root.exists():
+        backup_archive = target_root.with_suffix(".pre-restore")
+        if backup_archive.exists():
+            shutil.rmtree(backup_archive)
+        shutil.copytree(target_root, backup_archive)
+        shutil.rmtree(target_root)
+
+    Repo.clone_from(str(source_bundle), str(target_root))
+
+
 def _ensure_str(value: str | bytes) -> str:
     """Ensure a value is a string, decoding bytes if necessary."""
     if isinstance(value, bytes):
@@ -987,10 +1592,12 @@ def _ensure_str(value: str | bytes) -> str:
     return value
 
 
-def collect_lock_status(settings: Settings) -> dict[str, Any]:
+def collect_lock_status(settings: Settings, project_slug: str | None = None) -> dict[str, Any]:
     """Return structured metadata about active archive locks."""
 
     root = Path(settings.storage.root).expanduser().resolve()
+    if project_slug:
+        root = root / "projects" / project_slug
     locks: list[dict[str, Any]] = []
     summary = {"total": 0, "active": 0, "stale": 0, "metadata_missing": 0}
 
@@ -1031,7 +1638,10 @@ def collect_lock_status(settings: Settings) -> dict[str, Any]:
                 with contextlib.suppress(Exception):
                     pid_int = int(pid_val)
             info["owner_pid"] = pid_int
-            info["owner_alive"] = AsyncFileLock._pid_alive(pid_int) if pid_int else False
+            owner_alive: bool | None = None
+            if pid_int is not None:
+                owner_alive = AsyncFileLock._pid_alive(pid_int)
+            info["owner_alive"] = owner_alive
 
             created_ts = metadata.get("created_ts") if isinstance(metadata, dict) else None
             if isinstance(created_ts, (int, float)):
@@ -1039,29 +1649,26 @@ def collect_lock_status(settings: Settings) -> dict[str, Any]:
                 info["age_seconds"] = max(0.0, now - float(created_ts))
             else:
                 info["created_ts"] = None
-                info["age_seconds"] = None
+                with contextlib.suppress(Exception):
+                    info["age_seconds"] = max(0.0, now - lock_path.stat().st_mtime)
+                if "age_seconds" not in info:
+                    info["age_seconds"] = None
 
             stale_threshold = AsyncFileLock(lock_path)._stale_timeout
             info["stale_timeout_seconds"] = stale_threshold
             age_val = info.get("age_seconds")
-            # Lock is stale if EITHER the owner is dead OR the age exceeds timeout
-            # Special case: if stale_timeout is 0, only check owner liveness (ignore age)
+            # Lock is stale if owner metadata proves the owner is gone OR if the
+            # lock file age exceeds the configured stale timeout.
             is_stale = False
-            if bool(metadata):
-                if not info["owner_alive"]:
-                    # Owner process is dead - lock is stale
-                    is_stale = True
-                elif stale_threshold > 0 and isinstance(age_val, (int, float)) and age_val >= stale_threshold:
-                    # Lock is too old - stale
-                    # (only if stale_timeout > 0, otherwise age check is disabled)
-                    is_stale = True
+            if owner_alive is False or (stale_threshold > 0 and isinstance(age_val, (int, float)) and age_val >= stale_threshold):
+                is_stale = True
             info["stale_suspected"] = is_stale
 
             summary["total"] += 1
 
             if is_stale:
                 summary["stale"] += 1
-            elif info["owner_alive"]:
+            elif info["owner_alive"] is True:
                 summary["active"] += 1
             if not metadata_present:
                 summary["metadata_missing"] += 1
@@ -1072,7 +1679,7 @@ def collect_lock_status(settings: Settings) -> dict[str, Any]:
 
 
 async def ensure_archive_root(settings: Settings) -> tuple[Path, Repo]:
-    repo_root = Path(settings.storage.root).expanduser().resolve()
+    repo_root = await _to_thread(_expanduser_resolve_path, Path(settings.storage.root))
     await _to_thread(repo_root.mkdir, parents=True, exist_ok=True)
     repo = await _ensure_repo(repo_root, settings)
     return repo_root, repo
@@ -1101,7 +1708,7 @@ async def _ensure_repo(root: Path, settings: Settings) -> Repo:
     2. Semaphore limits concurrent repo operations
     3. Proactive cleanup runs before creating new repos when FD headroom is low
     """
-    cache_key = str(root.resolve())
+    cache_key = str(await _to_thread(_resolve_path, root))
 
     # Fast path: check cache without lock using peek() which doesn't modify LRU order
     cached = _REPO_CACHE.peek(cache_key)
@@ -1151,9 +1758,9 @@ async def _ensure_repo(root: Path, settings: Settings) -> Repo:
         return repo
 
 
-async def write_agent_profile(archive: ProjectArchive, agent: dict[str, object]) -> None:
-    profile_path = archive.root / "agents" / agent["name"].__str__() / "profile.json"
-    await _write_json(profile_path, agent)
+async def write_agent_profile(archive: ProjectArchive, agent: Mapping[str, object]) -> None:
+    profile_path = archive.root / "agents" / str(agent["name"]) / "profile.json"
+    await _write_json(profile_path, dict(agent))
     rel = profile_path.relative_to(archive.repo_root).as_posix()
     await _commit(archive.repo, archive.settings, f"agent: profile {agent['name']}", [rel])
 
@@ -1182,7 +1789,7 @@ async def write_file_reservation_records(
         normalized_file_reservation = dict(file_reservation)
         normalized_file_reservation["path_pattern"] = path_pattern
         normalized_file_reservation.pop("path", None)
-        digest = hashlib.sha1(path_pattern.encode("utf-8")).hexdigest()
+        digest = hashlib.sha1(path_pattern.encode("utf-8"), usedforsecurity=False).hexdigest()
         # Legacy path: digest of path_pattern (kept to avoid stale artifacts in existing installs)
         legacy_path = archive.root / "file_reservations" / f"{digest}.json"
         await _write_json(legacy_path, normalized_file_reservation)
@@ -1213,6 +1820,7 @@ async def write_message_bundle(
     recipients: Sequence[str],
     extra_paths: Sequence[str] | None = None,
     commit_text: str | None = None,
+    sender_outbox_name: str | None = None,
 ) -> None:
     timestamp_obj: Any = message.get("created") or message.get("created_ts")
     now: datetime
@@ -1242,18 +1850,40 @@ async def write_message_bundle(
     m_dir = now.strftime("%m")
 
     canonical_dir = archive.root / "messages" / y_dir / m_dir
-    outbox_dir = archive.root / "agents" / sender / "outbox" / y_dir / m_dir
-    inbox_dirs = [archive.root / "agents" / r / "inbox" / y_dir / m_dir for r in recipients]
+    outbox_dir = (
+        archive.root / "agents" / sender_outbox_name / "outbox" / y_dir / m_dir
+        if sender_outbox_name
+        else None
+    )
+    inbox_dirs = [(r, archive.root / "agents" / r / "inbox" / y_dir / m_dir) for r in recipients]
 
     rel_paths: list[str] = []
 
     await _to_thread(canonical_dir.mkdir, parents=True, exist_ok=True)
-    await _to_thread(outbox_dir.mkdir, parents=True, exist_ok=True)
-    for path in inbox_dirs:
+    if outbox_dir is not None:
+        await _to_thread(outbox_dir.mkdir, parents=True, exist_ok=True)
+    for _r, path in inbox_dirs:
         await _to_thread(path.mkdir, parents=True, exist_ok=True)
 
-    frontmatter = json.dumps(message, indent=2, sort_keys=True)
-    content = f"---json\n{frontmatter}\n---\n\n{body_md.strip()}\n"
+    # BCC privacy (issue #186): the full bcc list is only ever visible to the
+    # sender. Canonical/outbox copies are the sender's own record and keep the
+    # full frontmatter; per-recipient inbox copies must redact bcc so that a
+    # to/cc recipient cannot see who was blind-copied, and a bcc recipient only
+    # ever sees their own name (never the other blind copies).
+    bcc_list = message.get("bcc")
+    bcc_names = {str(name) for name in bcc_list} if isinstance(bcc_list, (list, tuple)) else set()
+
+    def _render_content(viewer: str | None) -> str:
+        if viewer is None or not bcc_names:
+            view_message = message
+        else:
+            view_message = dict(message)
+            view_message["bcc"] = [viewer] if viewer in bcc_names else []
+        frontmatter = json.dumps(view_message, indent=2, sort_keys=True)
+        return f"---json\n{frontmatter}\n---\n\n{body_md.strip()}\n"
+
+    # Sender-side copies (canonical archive + sender outbox) retain full bcc.
+    content = _render_content(None)
 
     # Descriptive, ISO-prefixed filename: <ISO>__<subject-slug>__<id>.md
     created_iso = now.astimezone(timezone.utc).strftime("%Y-%m-%dT%H-%M-%SZ")
@@ -1269,13 +1899,14 @@ async def write_message_bundle(
     await _write_text(canonical_path, content)
     rel_paths.append(canonical_path.relative_to(archive.repo_root).as_posix())
 
-    outbox_path = outbox_dir / filename
-    await _write_text(outbox_path, content)
-    rel_paths.append(outbox_path.relative_to(archive.repo_root).as_posix())
+    if outbox_dir is not None:
+        outbox_path = outbox_dir / filename
+        await _write_text(outbox_path, content)
+        rel_paths.append(outbox_path.relative_to(archive.repo_root).as_posix())
 
-    for inbox_dir in inbox_dirs:
+    for recipient_name, inbox_dir in inbox_dirs:
         inbox_path = inbox_dir / filename
-        await _write_text(inbox_path, content)
+        await _write_text(inbox_path, _render_content(recipient_name))
         rel_paths.append(inbox_path.relative_to(archive.repo_root).as_posix())
 
     # Update thread-level digest for human review if thread_id present
@@ -1287,7 +1918,10 @@ async def write_message_bundle(
             thread_id_obj.strip(),
             {
                 "from": sender,
-                "to": list(recipients),
+                # Exclude bcc recipients (#186): the thread digest is a shared
+                # file (messages/threads/<id>.md) readable by every thread
+                # participant, so it must not reveal who was blind-copied.
+                "to": [r for r in recipients if r not in bcc_names],
                 "subject": message.get("subject", "") or "",
                 "created": timestamp_str,
             },
@@ -1443,7 +2077,7 @@ async def process_attachments(
                     raise ValueError(
                         "Absolute attachment paths are disabled. Set ALLOW_ABSOLUTE_ATTACHMENT_PATHS=true to enable."
                     )
-                resolved = p.expanduser().resolve()
+                resolved = await _to_thread(_expanduser_resolve_path, p)
             else:
                 resolved = _resolve_archive_relative_path(archive, path)
             meta, rel_path = await _store_image(archive, resolved, embed_policy=embed_policy)
@@ -1495,7 +2129,7 @@ async def _convert_markdown_images(
                 result_parts.append(raw_path)
                 last_idx = path_end
                 continue
-            file_path = file_path.expanduser().resolve()
+            file_path = await _to_thread(_expanduser_resolve_path, file_path)
         else:
             try:
                 file_path = _resolve_archive_relative_path(archive, normalized_path)
@@ -1539,7 +2173,15 @@ async def _store_image(archive: ProjectArchive, path: Path, *, embed_policy: str
         width, height = img.size
         buffer_path = archive.attachments_dir
         await _to_thread(buffer_path.mkdir, parents=True, exist_ok=True)
-        digest = hashlib.sha1(data).hexdigest()
+        # Use SHA256 for new content-addressable writes.  SHA256 is collision-
+        # resistant in the cryptographic sense and avoids the theoretical
+        # SHAttered (2017) chosen-prefix collision risk present in SHA1.
+        # Legacy blobs already on disk keep their 40-char SHA1 filenames; the
+        # digest field in returned metadata uses the field name ``"sha1"`` for
+        # backward-compat with all existing consumers (the field now carries
+        # a 64-char SHA256 hex string for new content, 40-char SHA1 for legacy
+        # content already present on disk — both are opaque keys to callers).
+        digest = hashlib.sha256(data).hexdigest()
         target_dir = buffer_path / digest[:2]
         await _to_thread(target_dir.mkdir, parents=True, exist_ok=True)
         target_path = target_dir / f"{digest}.webp"
@@ -1638,15 +2280,17 @@ async def _write_json(path: Path, payload: dict[str, object]) -> None:
     await _write_text(path, content + "\n")
 
 
-async def _append_attachment_audit(archive: ProjectArchive, sha1: str, event: dict[str, object]) -> None:
+async def _append_attachment_audit(archive: ProjectArchive, digest: str, event: dict[str, object]) -> None:
     """Append a single JSON line audit record for an attachment digest.
 
-    Creates attachments/_audit/<sha1>.log if missing. Best-effort; failures are ignored.
+    Creates attachments/_audit/<digest>.log if missing. Best-effort; failures are ignored.
+    The digest is a SHA256 hex string for new content (64 chars) or a legacy SHA1
+    hex string (40 chars) for content written by older versions of this code.
     """
     try:
         audit_dir = archive.root / "attachments" / "_audit"
         await _to_thread(audit_dir.mkdir, parents=True, exist_ok=True)
-        audit_path = audit_dir / f"{sha1}.log"
+        audit_path = audit_dir / f"{digest}.log"
 
         def _append_line() -> None:
             line = json.dumps(event, sort_keys=True)
@@ -1918,7 +2562,7 @@ async def _commit(
     working_tree = repo.working_tree_dir
     if working_tree is None:
         raise ValueError("Repository has no working tree directory")
-    repo_root = Path(working_tree).resolve()
+    repo_root = await _to_thread(_resolve_path, Path(working_tree))
 
     if use_queue:
         # Use commit queue for batching under high load
@@ -1929,39 +2573,55 @@ async def _commit(
         await _commit_direct(repo_root, settings, message, rel_paths)
 
 
-async def heal_archive_locks(settings: Settings) -> dict[str, Any]:
+async def heal_archive_locks(settings: Settings, project_slug: str | None = None) -> dict[str, Any]:
     """Scan the archive root for stale lock artifacts and clean them."""
 
-    root = Path(settings.storage.root).expanduser().resolve()
+    root = await _to_thread(_expanduser_resolve_path, Path(settings.storage.root))
     await _to_thread(root.mkdir, parents=True, exist_ok=True)
+    if project_slug:
+        root = root / "projects" / project_slug
     summary: dict[str, Any] = {
         "locks_scanned": 0,
         "locks_removed": [],
         "metadata_removed": [],
     }
-    if not root.exists():
+    if not await _to_thread(_path_exists, root):
         return summary
 
-    for lock_path_item in sorted(root.rglob("*.lock"), key=str):
+    lock_paths = sorted(await _to_thread(_list_rglob_paths, root, "*.lock"), key=str)
+    for lock_path_item in lock_paths:
         # rglob returns Path objects at runtime; cast for type checker
         lock_path = cast(Path, lock_path_item)
         summary["locks_scanned"] += 1
         try:
-            lock = AsyncFileLock(lock_path, timeout_seconds=0.0, stale_timeout_seconds=0.0)
+            # Use the configured age-based stale threshold UNCONDITIONALLY,
+            # regardless of whether the .owner.json sidecar is present. The
+            # previous behaviour forced ``stale_timeout=0`` whenever metadata
+            # existed, which disabled the age path and made ``heal_archive_locks``
+            # remove a lock only when the owning PID was dead. That diverged from
+            # ``collect_lock_status`` (used by ``doctor check``), which always
+            # applies the age threshold — so a lock wedged by a still-alive but
+            # interrupted server (issue #166) was reported as stale by
+            # ``doctor check`` yet skipped by ``doctor repair`` ("No stale locks
+            # to heal"). Sharing one staleness definition keeps check and repair
+            # in agreement: a lock is healed if its owner is provably gone OR its
+            # age exceeds the threshold.
+            lock = AsyncFileLock(lock_path, timeout_seconds=0.0)
             removed = await _to_thread(lock._cleanup_if_stale)
             if removed:
                 summary["locks_removed"].append(str(lock_path))
         except FileNotFoundError:
             continue
 
-    for metadata_path_item in sorted(root.rglob("*.lock.owner.json"), key=str):
+    metadata_paths = sorted(await _to_thread(_list_rglob_paths, root, "*.lock.owner.json"), key=str)
+    for metadata_path_item in metadata_paths:
         # rglob returns Path objects at runtime; cast for type checker
         metadata_path = cast(Path, metadata_path_item)
         name = metadata_path.name
         if not name.endswith(".owner.json"):
             continue
         lock_candidate = metadata_path.parent / name[: -len(".owner.json")]
-        if lock_candidate.exists():
+        if await _to_thread(_path_exists, lock_candidate):
             continue
         try:
             await _to_thread(metadata_path.unlink)
@@ -2665,7 +3325,7 @@ async def get_historical_inbox_snapshot(
         messages = []
         try:
             # Navigate to the inbox folder in the commit tree
-            tree = closest_commit.tree
+            tree = cast(Any, closest_commit.tree)
             for part in inbox_path.split("/"):
                 tree = tree / part
 
@@ -2793,9 +3453,78 @@ class BackupManifest:
     restore_instructions: str
 
 
+def _parse_backup_manifest(data: Any) -> BackupManifest:
+    """Validate and normalize backup manifest payloads."""
+    if not isinstance(data, dict):
+        raise ValueError("manifest.json must contain a JSON object")
+
+    version = data.get("version")
+    if not isinstance(version, int) or version < 1:
+        raise ValueError("manifest.json must include an integer version >= 1")
+
+    created_at = data.get("created_at")
+    if not isinstance(created_at, str) or not created_at.strip():
+        raise ValueError("manifest.json must include a non-empty created_at string")
+
+    reason = data.get("reason")
+    if not isinstance(reason, str) or not reason.strip():
+        raise ValueError("manifest.json must include a non-empty reason string")
+
+    database_path = data.get("database_path")
+    if database_path is not None and not isinstance(database_path, str):
+        raise ValueError("manifest.json database_path must be a string or null")
+
+    project_bundles_raw = data.get("project_bundles")
+    if not isinstance(project_bundles_raw, list) or not all(isinstance(item, str) for item in project_bundles_raw):
+        raise ValueError("manifest.json project_bundles must be a list of strings")
+    project_bundles = [str(item) for item in project_bundles_raw]
+
+    storage_root = data.get("storage_root")
+    if not isinstance(storage_root, str) or not storage_root.strip():
+        raise ValueError("manifest.json must include a non-empty storage_root string")
+
+    restore_instructions = data.get("restore_instructions")
+    if not isinstance(restore_instructions, str) or not restore_instructions.strip():
+        raise ValueError("manifest.json must include non-empty restore_instructions")
+
+    if database_path is None and not project_bundles:
+        raise ValueError("manifest.json must include a database backup or at least one archive bundle")
+
+    return BackupManifest(
+        version=version,
+        created_at=created_at,
+        reason=reason,
+        database_path=database_path,
+        project_bundles=project_bundles,
+        storage_root=storage_root,
+        restore_instructions=restore_instructions,
+    )
+
+
+def _resolve_backup_artifact_path(backup_path: Path, manifest_ref: str) -> Path:
+    """Resolve a manifest-recorded artifact path against a backup directory."""
+    backup_root = backup_path.expanduser().resolve()
+    candidate = Path(manifest_ref).expanduser()
+    resolved = candidate.resolve() if candidate.is_absolute() else (backup_root / candidate).resolve()
+    try:
+        resolved.relative_to(backup_root)
+    except ValueError as exc:
+        raise ValueError(f"Backup artifact path escapes backup directory: {manifest_ref}") from exc
+    return resolved
+
+
+def _resolve_backup_file_artifact(backup_path: Path, manifest_ref: str) -> Path:
+    """Resolve a manifest artifact and require that it exists as a file."""
+    resolved = _resolve_backup_artifact_path(backup_path, manifest_ref)
+    if not resolved.exists():
+        raise FileNotFoundError(manifest_ref)
+    if not resolved.is_file():
+        raise IsADirectoryError(manifest_ref)
+    return resolved
+
+
 async def create_diagnostic_backup(
     settings: Settings,
-    project_slug: str | None = None,
     backup_dir: Path | None = None,
     reason: str = "doctor-repair",
 ) -> Path:
@@ -2805,13 +3534,12 @@ async def create_diagnostic_backup(
 
     Args:
         settings: Application settings
-        project_slug: Specific project to backup, or None for all projects
         backup_dir: Directory to store backup, or None for default
         reason: Reason for backup (included in manifest)
 
     Returns:
         Path to backup directory containing:
-        - {project_slug}.bundle (git bundle of project archive)
+        - archive.bundle (git bundle of project archive)
         - database.sqlite3 (copy of full database)
         - manifest.json (what was backed up, when, why, restore instructions)
     """
@@ -2822,109 +3550,105 @@ async def create_diagnostic_backup(
     # Create backup directory
     if backup_dir is None:
         backup_dir = Path(settings.storage.root) / "backups"
-    backup_dir = backup_dir.expanduser().resolve()
-
-    timestamp = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H-%M-%S")
-    backup_path = backup_dir / f"{timestamp}_{reason}"
-    backup_path.mkdir(parents=True, exist_ok=True)
-
-    project_bundles: list[str] = []
-    database_copied: str | None = None
+    backup_dir = await _to_thread(_expanduser_resolve_path, backup_dir)
 
     # Get the archive repo
-    archive_root = Path(settings.storage.root).expanduser().resolve()
-    if not archive_root.exists():
-        raise ValueError(f"Storage root does not exist: {archive_root}")
+    archive_root = await _to_thread(_expanduser_resolve_path, Path(settings.storage.root))
 
     # Copy database
     db_path = get_database_path(settings)
-    if db_path and db_path.exists():
-        db_backup = backup_path / "database.sqlite3"
+    has_database = bool(db_path and await _to_thread(_path_exists, db_path))
+    has_archive_repo = await _to_thread(_path_exists, archive_root / ".git")
+    if not has_database and not has_archive_repo:
+        raise ValueError("No database or archive bundle available to back up")
 
-        def _copy_db() -> None:
-            # Use shutil.copy2 to preserve metadata
-            shutil.copy2(db_path, db_backup)
-            # Also copy WAL and SHM files if they exist
-            wal_path = db_path.with_suffix(".sqlite3-wal")
-            shm_path = db_path.with_suffix(".sqlite3-shm")
-            if wal_path.exists():
-                shutil.copy2(wal_path, backup_path / wal_path.name)
-            if shm_path.exists():
-                shutil.copy2(shm_path, backup_path / shm_path.name)
+    backup_path = await _to_thread(_create_unique_backup_dir, backup_dir, reason)
+    try:
+        project_bundles: list[str] = []
+        database_copied: str | None = None
 
-        await _to_thread(_copy_db)
-        database_copied = str(db_backup)
+        if db_path and has_database:
+            db_backup = backup_path / "database.sqlite3"
 
-    # Create git bundles for projects
-    repo_path = archive_root
-    if repo_path.exists() and (repo_path / ".git").exists():
+            def _copy_db() -> None:
+                # Use shutil.copy2 to preserve metadata
+                shutil.copy2(db_path, db_backup)
+                # Also copy WAL and SHM files if they exist
+                wal_path, shm_path = get_sqlite_sidecar_paths(db_path)
+                backup_wal, backup_shm = get_sqlite_sidecar_paths(db_backup)
+                if wal_path.exists():
+                    shutil.copy2(wal_path, backup_wal)
+                if shm_path.exists():
+                    shutil.copy2(shm_path, backup_shm)
 
-        def _create_bundles() -> list[str]:
-            bundles: list[str] = []
-            repo = Repo(repo_path)
-            try:
-                if project_slug:
-                    # Single project bundle
-                    bundle_path = backup_path / f"{project_slug}.bundle"
-                    try:
-                        # Create bundle of the entire repo (includes all history)
-                        repo.git.bundle("create", str(bundle_path), "--all")
-                        bundles.append(str(bundle_path))
-                    except Exception:
-                        pass  # Skip if bundle creation fails
-                else:
-                    # Bundle entire archive
+            await _to_thread(_copy_db)
+            database_copied = db_backup.relative_to(backup_path).as_posix()
+
+        # Create git bundles for projects
+        repo_path = archive_root
+        if has_archive_repo:
+
+            def _create_bundles() -> list[str]:
+                bundles: list[str] = []
+                repo = Repo(repo_path)
+                try:
                     bundle_path = backup_path / "archive.bundle"
                     try:
                         repo.git.bundle("create", str(bundle_path), "--all")
-                        bundles.append(str(bundle_path))
-                    except Exception:
-                        pass
-            finally:
-                repo.close()
+                        bundles.append(bundle_path.relative_to(backup_path).as_posix())
+                    except Exception as exc:
+                        raise RuntimeError(f"Failed to create archive bundle backup for {repo_path}") from exc
+                finally:
+                    repo.close()
 
-            return bundles
+                return bundles
 
-        project_bundles = await _to_thread(_create_bundles)
+            project_bundles = await _to_thread(_create_bundles)
 
-    # Write manifest
-    manifest = BackupManifest(
-        version=1,
-        created_at=datetime.now(timezone.utc).isoformat(),
-        reason=reason,
-        database_path=database_copied,
-        project_bundles=project_bundles,
-        storage_root=str(archive_root),
-        restore_instructions=(
-            "To restore:\n"
-            "1. Stop any running MCP Agent Mail processes\n"
-            "2. Copy database.sqlite3 back to original location\n"
-            "3. Use 'git clone --bare <bundle> <target>' to restore archive\n"
-            "4. Restart MCP Agent Mail"
-        ),
-    )
+        if database_copied is None and not project_bundles:
+            raise ValueError("No database or archive bundle available to back up")
 
-    manifest_path = backup_path / "manifest.json"
+        # Write manifest
+        manifest = BackupManifest(
+            version=1,
+            created_at=datetime.now(timezone.utc).isoformat(),
+            reason=reason,
+            database_path=database_copied,
+            project_bundles=project_bundles,
+            storage_root=str(archive_root),
+            restore_instructions=(
+                "To restore:\n"
+                "1. Stop any running MCP Agent Mail processes\n"
+                "2. Copy database.sqlite3 back to original location\n"
+                "3. Use 'git clone --bare <bundle> <target>' to restore archive\n"
+                "4. Restart MCP Agent Mail"
+            ),
+        )
 
-    def _write_manifest() -> None:
-        with manifest_path.open("w", encoding="utf-8") as f:
-            json.dump(
-                {
-                    "version": manifest.version,
-                    "created_at": manifest.created_at,
-                    "reason": manifest.reason,
-                    "database_path": manifest.database_path,
-                    "project_bundles": manifest.project_bundles,
-                    "storage_root": manifest.storage_root,
-                    "restore_instructions": manifest.restore_instructions,
-                },
-                f,
-                indent=2,
-            )
+        manifest_path = backup_path / "manifest.json"
 
-    await _to_thread(_write_manifest)
+        def _write_manifest() -> None:
+            with manifest_path.open("w", encoding="utf-8") as f:
+                json.dump(
+                    {
+                        "version": manifest.version,
+                        "created_at": manifest.created_at,
+                        "reason": manifest.reason,
+                        "database_path": manifest.database_path,
+                        "project_bundles": manifest.project_bundles,
+                        "storage_root": manifest.storage_root,
+                        "restore_instructions": manifest.restore_instructions,
+                    },
+                    f,
+                    indent=2,
+                )
 
-    return backup_path
+        await _to_thread(_write_manifest)
+
+        return backup_path
+    except Exception:
+        await _to_thread(shutil.rmtree, backup_path, ignore_errors=True)
+        raise
 
 
 async def list_backups(settings: Settings) -> list[dict[str, Any]]:
@@ -2933,8 +3657,9 @@ async def list_backups(settings: Settings) -> list[dict[str, Any]]:
     Returns:
         List of backup info dicts with path, created_at, reason, size
     """
-    backup_dir = Path(settings.storage.root).expanduser().resolve() / "backups"
-    if not backup_dir.exists():
+    backup_dir = await _to_thread(_expanduser_resolve_path, Path(settings.storage.root))
+    backup_dir = backup_dir / "backups"
+    if not await _to_thread(_path_exists, backup_dir):
         return []
 
     backups: list[dict[str, Any]] = []
@@ -2947,20 +3672,40 @@ async def list_backups(settings: Settings) -> list[dict[str, Any]]:
                 if manifest_path.exists():
                     try:
                         with manifest_path.open(encoding="utf-8") as f:
-                            manifest_data = json.load(f)
+                            manifest_data = _parse_backup_manifest(json.load(f))
+                        if manifest_data.database_path is not None:
+                            try:
+                                _resolve_backup_file_artifact(entry, manifest_data.database_path)
+                            except FileNotFoundError as exc:
+                                raise ValueError(
+                                    f"Backup database artifact missing: {manifest_data.database_path}"
+                                ) from exc
+                            except IsADirectoryError as exc:
+                                raise ValueError(
+                                    f"Backup database artifact is not a file: {manifest_data.database_path}"
+                                ) from exc
+                        for bundle_ref in manifest_data.project_bundles:
+                            try:
+                                _resolve_backup_file_artifact(entry, bundle_ref)
+                            except FileNotFoundError as exc:
+                                raise ValueError(f"Backup bundle artifact missing: {bundle_ref}") from exc
+                            except IsADirectoryError as exc:
+                                raise ValueError(
+                                    f"Backup bundle artifact is not a file: {bundle_ref}"
+                                ) from exc
                         # Calculate total size
                         total_size = sum(
                             p.stat().st_size for p in entry.rglob("*") if p.is_file()
                         )
                         results.append({
                             "path": str(entry),
-                            "created_at": manifest_data.get("created_at"),
-                            "reason": manifest_data.get("reason"),
+                            "created_at": manifest_data.created_at,
+                            "reason": manifest_data.reason,
                             "size_bytes": total_size,
-                            "has_database": manifest_data.get("database_path") is not None,
-                            "bundle_count": len(manifest_data.get("project_bundles", [])),
+                            "has_database": manifest_data.database_path is not None,
+                            "bundle_count": len(manifest_data.project_bundles),
                         })
-                    except (json.JSONDecodeError, OSError):
+                    except (ValueError, json.JSONDecodeError, OSError):
                         pass
         return results
 
@@ -2971,7 +3716,6 @@ async def list_backups(settings: Settings) -> list[dict[str, Any]]:
 async def restore_from_backup(
     settings: Settings,
     backup_path: Path,
-    target_project: str | None = None,
     *,
     dry_run: bool = False,
 ) -> dict[str, Any]:
@@ -2980,7 +3724,6 @@ async def restore_from_backup(
     Args:
         settings: Application settings
         backup_path: Path to backup directory
-        target_project: Specific project to restore, or None for all
         dry_run: If True, only report what would be restored
 
     Returns:
@@ -2991,19 +3734,19 @@ async def restore_from_backup(
     from .db import get_database_path
 
     manifest_path = backup_path / "manifest.json"
-    if not manifest_path.exists():
+    if not await _to_thread(_path_exists, manifest_path):
         raise ValueError(f"No manifest.json found in {backup_path}")
 
     def _read_manifest() -> dict[str, Any]:
         with manifest_path.open(encoding="utf-8") as f:
             return json.load(f)
 
-    manifest_data = await _to_thread(_read_manifest)
+    manifest = _parse_backup_manifest(await _to_thread(_read_manifest))
 
     results: dict[str, Any] = {
         "backup_path": str(backup_path),
-        "created_at": manifest_data.get("created_at"),
-        "reason": manifest_data.get("reason"),
+        "created_at": manifest.created_at,
+        "reason": manifest.reason,
         "dry_run": dry_run,
         "database_restored": False,
         "bundles_restored": [],
@@ -3011,28 +3754,88 @@ async def restore_from_backup(
     }
 
     if dry_run:
-        results["would_restore_database"] = manifest_data.get("database_path") is not None
-        results["would_restore_bundles"] = manifest_data.get("project_bundles", [])
+        would_restore_database = False
+        if manifest.database_path is not None:
+            db_path = get_database_path(settings)
+            if db_path is None:
+                results["errors"].append(
+                    "Current configuration does not use a SQLite database file; "
+                    "cannot restore database payload"
+                )
+            else:
+                try:
+                    _resolve_backup_file_artifact(backup_path, manifest.database_path)
+                    would_restore_database = True
+                except FileNotFoundError:
+                    results["errors"].append(f"Database backup not found: {manifest.database_path}")
+                except IsADirectoryError:
+                    results["errors"].append(
+                        f"Database backup artifact is not a file: {manifest.database_path}"
+                    )
+        would_restore_bundles: list[str] = []
+        for bundle_ref in manifest.project_bundles:
+            try:
+                _resolve_backup_file_artifact(backup_path, bundle_ref)
+                would_restore_bundles.append(bundle_ref)
+            except FileNotFoundError:
+                results["errors"].append(f"Bundle not found: {bundle_ref}")
+            except IsADirectoryError:
+                results["errors"].append(f"Bundle artifact is not a file: {bundle_ref}")
+        results["would_restore_database"] = would_restore_database
+        results["would_restore_bundles"] = would_restore_bundles
         return results
 
     # Restore database
-    db_backup = backup_path / "database.sqlite3"
-    if db_backup.exists():
+    db_backup: Path | None = None
+    if manifest.database_path:
+        try:
+            db_backup = _resolve_backup_file_artifact(backup_path, manifest.database_path)
+        except FileNotFoundError:
+            results["errors"].append(f"Database backup not found: {manifest.database_path}")
+        except IsADirectoryError:
+            results["errors"].append(
+                f"Database backup artifact is not a file: {manifest.database_path}"
+            )
+
+    if db_backup is not None:
         db_path = get_database_path(settings)
-        if db_path:
+        if db_path is None:
+            results["errors"].append(
+                "Current configuration does not use a SQLite database file; "
+                "cannot restore database payload"
+            )
+        else:
             try:
 
                 def _restore_db() -> None:
                     # Backup current DB first (safety)
+                    db_path.parent.mkdir(parents=True, exist_ok=True)
+                    wal_target, shm_target = get_sqlite_sidecar_paths(db_path)
+                    pre_restore_db = get_sqlite_pre_restore_path(db_path)
+                    pre_restore_wal, pre_restore_shm = get_sqlite_sidecar_paths(pre_restore_db)
                     if db_path.exists():
-                        shutil.copy2(db_path, db_path.with_suffix(".sqlite3.pre-restore"))
+                        shutil.copy2(db_path, pre_restore_db)
+                    else:
+                        pre_restore_db.unlink(missing_ok=True)
+                    if wal_target.exists():
+                        shutil.copy2(wal_target, pre_restore_wal)
+                    else:
+                        pre_restore_wal.unlink(missing_ok=True)
+                    if shm_target.exists():
+                        shutil.copy2(shm_target, pre_restore_shm)
+                    else:
+                        pre_restore_shm.unlink(missing_ok=True)
                     shutil.copy2(db_backup, db_path)
                     # Also restore WAL and SHM if present in backup
-                    for suffix in ["-wal", "-shm"]:
-                        backup_file = backup_path / f"database.sqlite3{suffix}"
-                        target_file = db_path.with_suffix(f".sqlite3{suffix}")
+                    backup_wal, backup_shm = get_sqlite_sidecar_paths(db_backup)
+                    for backup_file, target_file in (
+                        (backup_wal, wal_target),
+                        (backup_shm, shm_target),
+                    ):
                         if backup_file.exists():
                             shutil.copy2(backup_file, target_file)
+                        else:
+                            target_file.unlink(missing_ok=True)
 
                 await _to_thread(_restore_db)
                 results["database_restored"] = True
@@ -3040,33 +3843,21 @@ async def restore_from_backup(
                 results["errors"].append(f"Database restore failed: {e}")
 
     # Restore git bundles
-    bundles = manifest_data.get("project_bundles", [])
-    archive_root = Path(settings.storage.root).expanduser().resolve()
-
-    def _restore_bundle(bundle_to_restore: Path, target_root: Path) -> None:
-        """Restore a git bundle to target directory."""
-        # Backup current archive
-        if target_root.exists():
-            backup_archive = target_root.with_suffix(".pre-restore")
-            if backup_archive.exists():
-                shutil.rmtree(backup_archive)
-            shutil.copytree(target_root, backup_archive)
-            shutil.rmtree(target_root)
-
-        # Clone from bundle
-        Repo.clone_from(str(bundle_to_restore), str(target_root))
+    bundles = manifest.project_bundles
+    archive_root = await _to_thread(_expanduser_resolve_path, Path(settings.storage.root))
 
     for bundle_path_str in bundles:
-        bundle_path = Path(bundle_path_str)
-        if not bundle_path.exists():
-            # Try relative to backup_path
-            bundle_path = backup_path / bundle_path.name
-        if not bundle_path.exists():
+        try:
+            bundle_path = _resolve_backup_file_artifact(backup_path, bundle_path_str)
+        except FileNotFoundError:
             results["errors"].append(f"Bundle not found: {bundle_path_str}")
+            continue
+        except IsADirectoryError:
+            results["errors"].append(f"Bundle artifact is not a file: {bundle_path_str}")
             continue
 
         try:
-            await _to_thread(_restore_bundle, bundle_path, archive_root)
+            await _to_thread(_restore_bundle_into_archive, bundle_path, archive_root)
             results["bundles_restored"].append(str(bundle_path))
         except Exception as e:
             results["errors"].append(f"Bundle restore failed for {bundle_path}: {e}")
@@ -3123,7 +3914,7 @@ async def emit_notification_signal(
     _SIGNAL_DEBOUNCE[debounce_key] = now_ms
 
     # Build signal file path
-    signals_dir = Path(settings.notifications.signals_dir).expanduser().resolve()
+    signals_dir = await _to_thread(_expanduser_resolve_path, Path(settings.notifications.signals_dir))
     signal_path = signals_dir / "projects" / project_slug / "agents" / f"{agent_name}.signal"
 
     # Prepare signal content
@@ -3174,7 +3965,7 @@ async def clear_notification_signal(
     if not settings.notifications.enabled:
         return False
 
-    signals_dir = Path(settings.notifications.signals_dir).expanduser().resolve()
+    signals_dir = await _to_thread(_expanduser_resolve_path, Path(settings.notifications.signals_dir))
     signal_path = signals_dir / "projects" / project_slug / "agents" / f"{agent_name}.signal"
 
     def _clear_signal() -> bool:

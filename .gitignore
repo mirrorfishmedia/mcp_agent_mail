@@ -217,6 +217,8 @@ screenshots/renamed
 screenshots/gif_frames
 temp.lock
 temp.lock.owner.json
+server.lock
+server.pid
 archived_mailbox_states/
 # Share export test output
 out/
@@ -224,6 +226,24 @@ out/
 # Cryptographic signing keys (Ed25519 key pairs for bundle signing)
 signing-*.key
 signing-*.pub
+
+# Generic private-key / secret patterns — belt-and-suspenders.
+# A real Ed25519 signing key was committed once via `git add -f` despite
+# signing-*.key being above; .githooks/pre-commit blocks the same mistake at
+# the index level, and these patterns block at the working-tree level.
+*.key
+!*.pub.key
+*.priv
+*.pem
+*.pfx
+*.p12
+id_rsa
+id_dsa
+id_ecdsa
+id_ed25519
+secrets.*
+*-secret
+*-secret.*
 
 # IDE settings
 .vscode/
@@ -268,3 +288,9 @@ test_screenshot.png
 
 # Literal tilde directory (created by agent mail git mailbox init)
 ~/
+
+# SQLite activity lock files
+*.activity.lock
+
+# OpenCode config (user-local; contains bearer tokens)
+/opencode.json

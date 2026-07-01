@@ -8,7 +8,7 @@ A mail-like coordination layer for coding agents, exposed as an HTTP-only FastMC
 
 Think of it as asynchronous email + directory + change-intent signaling for your agents, backed by Git (for human-auditable artifacts) and SQLite (for indexing and queries).
 
-Status: Under active development. The design is captured in detail in `project_idea_and_guide.md` (start with the original prompt at the top of that file).
+Status: Under active development. The design is captured in detail in `docs/planning/project_idea_and_guide.md` (start with the original prompt at the top of that file).
 
 ## Why this exists
 
@@ -30,7 +30,7 @@ It's designed for: FastMCP clients and CLI tools (Claude Code, Codex, Gemini CLI
 
 ## From Idea Spark to Shipping Swarm
 
-If a blank repo feels daunting, follow the field-tested workflow we documented in `project_idea_and_guide.md` (“Appendix: From Blank Repo to Coordinated Swarm”):
+If a blank repo feels daunting, follow the field-tested workflow we documented in `docs/planning/project_idea_and_guide.md` (“Appendix: From Blank Repo to Coordinated Swarm”):
 
 - **Ideate fast:** Write a scrappy email-style blurb about the problem, desired UX, and any must-have stack picks (≈15 minutes).
 - **Promote it to a plan:** Feed that blurb to GPT-5 Pro (and optionally Grok4 Heavy / Opus 4.1) until you get a granular Markdown plan, then iterate on the plan file while it’s still cheap to change. The Markdown Web Browser sample plan shows the level of detail to aim for.
@@ -167,7 +167,7 @@ How to use effectively
    - Register an identity: call `ensure_project`, then `register_agent` using this repo's absolute path as `project_key`.
    - Reserve files before you edit: `file_reservation_paths(project_key, agent_name, ["src/**"], ttl_seconds=3600, exclusive=true)` to signal intent and avoid conflict.
    - Communicate with threads: use `send_message(..., thread_id="FEAT-123")`; check inbox with `fetch_inbox` and acknowledge with `acknowledge_message`.
-   - Read fast: `resource://inbox/{Agent}?project=<abs-path>&limit=20` or `resource://thread/{id}?project=<abs-path>&include_bodies=true`.
+   - Read fast: `resource://inbox/{Agent}?project=<abs-path>&limit=20&agent_token=<registration_token>` or `resource://thread/{id}?project=<abs-path>&agent=<Agent>&agent_token=<registration_token>&include_bodies=true` unless the current MCP session already authenticated as that agent.
    - Tip: set `AGENT_NAME` in your environment so the pre-commit guard can block commits that conflict with others' active exclusive file reservations.
 
 2) Across different repos in one project (e.g., Next.js frontend + FastAPI backend)
@@ -379,7 +379,7 @@ Advanced (manual commands):
 ```bash
 uv run python -m mcp_agent_mail.http --host 127.0.0.1 --port 8765
 # or:
-uv run uvicorn mcp_agent_mail.http:build_http_app --factory --host 127.0.0.1 --port 8765
+uv run uvicorn mcp_agent_mail.http:create_app --factory --host 127.0.0.1 --port 8765
 ```
 
 Auth notes:
@@ -906,7 +906,7 @@ The wizard provides a fully automated end-to-end deployment experience:
    - Supports multiple selection modes: `all`, single number (`1`), lists (`1,3,5`), or ranges (`1-3`, `2-5,8`)
    - Remembers your previous selection for quick re-export
 7. **Redaction configuration**: Choose between `standard` (scrub secrets like API keys/tokens, keep agent names) or `strict` (redact all message bodies)
-8. **Cryptographic signing**: Optional Ed25519 signing with automatic key generation or reuse of existing keys
+8. **Cryptographic signing**: Optional Ed25519 signing with automatic key generation or reuse of existing keys. Generated keys are written to `~/.mcp-agent-mail/signing-keys/` (mode 0700, never to the cwd) so they cannot be accidentally `git add -f`'d into a repository
 9. **Pre-flight validation**: Checks that GitHub repo names are available before starting the export
 10. **Deployment summary**: Shows what will be deployed (project count, bundle size, target, signing status) and asks for confirmation
 11. **Export and preview**: Exports the bundle and launches an interactive preview server with automatic port detection (tries 9000-9100)
@@ -1662,7 +1662,7 @@ sequenceDiagram
 
 3) Check inbox
 
-- `fetch_inbox(project_key, agent_name, since_ts?, urgent_only?, include_bodies?, limit?)` returns recent messages, preserving thread_id where available.
+- `fetch_inbox(project_key, agent_name, since_ts?, urgent_only?, unread_only?, include_bodies?, limit?)` returns recent messages, preserving thread_id where available. Pass `unread_only=true` to skip messages this recipient has already explicitly marked read (cuts token-burn for polling agents).
 - `acknowledge_message(project_key, agent_name, message_id)` marks acknowledgements.
 
 4) Avoid conflicts with file reservations (leases)
@@ -1691,7 +1691,7 @@ sequenceDiagram
 
 - `search_messages(project_key, query, limit?)` uses FTS5 over subject and body.
 - `summarize_thread(project_key, thread_id, include_examples?)` extracts key points, actions, and participants from the thread.
-- `reply_message(project_key, message_id, sender_name, body_md, ...)` creates a subject-prefixed reply, preserving or creating a thread.
+- `reply_message(project_key, message_id, sender_name, body_md, ..., sender_token?)` creates a subject-prefixed reply, preserving or creating a thread.
 
 ### Semantics & invariants
 
@@ -1705,6 +1705,7 @@ sequenceDiagram
 - Attachments
   - Image references (file path or data URI) are converted to WebP; small images embed inline when policy allows
   - Non-absolute `attachment_paths` (and markdown image paths) resolve relative to the project archive root under `STORAGE_ROOT/projects/<slug>/`, not the code repo root
+  - Absolute attachment paths are disabled by default. Enabling `ALLOW_ABSOLUTE_ATTACHMENT_PATHS=true` on a networked deployment turns message sending into a filesystem read primitive for whatever paths the server process can access.
   - Stored under `attachments/<xx>/<sha1>.webp` and referenced by relative path in frontmatter
 - File Reservations
   - TTL-based; exclusive means "please don't modify overlapping surfaces" for others until expiry or release
@@ -1734,9 +1735,12 @@ Use `set_contact_policy(project_key, agent_name, policy)` to update.
 
 ### Request/approve contact
 
-- `request_contact(project_key, from_agent, to_agent, reason?, ttl_seconds?)` creates or refreshes a pending link and sends a small ack_required "intro" message to the recipient.
-- `respond_contact(project_key, to_agent, from_agent, accept, ttl_seconds?)` approves or denies; approval grants messaging until expiry.
-- `list_contacts(project_key, agent_name)` surfaces current links.
+- `request_contact(project_key, from_agent, to_agent, reason?, ttl_seconds?, registration_token?)` creates or refreshes a pending link and sends a small ack_required "intro" message to the recipient.
+- `respond_contact(project_key, to_agent, from_agent, accept, ttl_seconds?, registration_token?)` approves or denies; approval grants messaging until expiry.
+- `list_contacts(project_key, agent_name)` surfaces outbound links with target projects and audit flags for expiry/messageability.
+
+Auth note: these tools require either an agent already authenticated in the current MCP session, or the relevant `registration_token`. `send_message(..., auto_contact_if_blocked=true)` only auto-approves when both agents are already authenticated in the same MCP session; otherwise it creates a pending `request_contact` and **fails loud** with `CONTACT_REQUIRED` (the underlying message body is *not* queued — once the recipient approves, the sender must re-call `send_message` to actually deliver the payload).
+`macro_contact_handshake(..., auto_accept=true)` follows the same rule for new approvals: it only auto-approves when the target agent is already authenticated in the current MCP session or when `target_registration_token` is supplied explicitly. If the link is already approved, the macro reuses that approval. Otherwise the request remains pending and the macro reports a `response_error`.
 
 ### Auto-allow heuristics (no explicit request required)
 
@@ -1754,9 +1758,9 @@ When two repos represent the same underlying project (e.g., `frontend` and `back
 
 2) Keep separate `project_key`s and establish explicit contact:
    - In `backend`, agent `GreenCastle` calls:
-     - `request_contact(project_key="/abs/path/backend", from_agent="GreenCastle", to_agent="BlueLake", reason="API contract changes")`
+     - `request_contact(project_key="/abs/path/backend", from_agent="GreenCastle", to_agent="BlueLake", reason="API contract changes", registration_token="<GreenCastle token>")`
    - In `frontend`, `BlueLake` calls:
-     - `respond_contact(project_key="/abs/path/backend", to_agent="BlueLake", from_agent="GreenCastle", accept=true)`
+     - `respond_contact(project_key="/abs/path/backend", to_agent="BlueLake", from_agent="GreenCastle", accept=true, registration_token="<BlueLake token>")`
    - After approval, messages can be exchanged; in default `auto` policy the server allows follow-up threads/reservation-based coordination without re-requesting.
 
 Important: You can also create reciprocal links or set `open` policy for trusted pairs. The consent layer is on by default (CONTACT_ENFORCEMENT_ENABLED=true) but is designed to be non-blocking in obvious collaboration contexts.
@@ -1772,7 +1776,7 @@ Example (conceptual) resource read:
 ```json
 {
   "method": "resources/read",
-  "params": {"uri": "resource://inbox/BlueLake?project=/abs/path/backend&limit=20"}
+  "params": {"uri": "resource://inbox/BlueLake?project=/abs/path/backend&limit=20&agent_token=<registration_token>"}
 }
 ```
 
@@ -1816,7 +1820,7 @@ sequenceDiagram
 - Gate: `WORKTREES_ENABLED=1` or `GIT_IDENTITY_ENABLED=1` enables git-based identity features. Default off.
 - Identity modes (default `dir`): `dir`, `git-remote`, `git-toplevel`, `git-common-dir`.
 - Inspect identity for a path:
-  - Resource (MCP): `resource://identity/{/abs/path}` (available when `WORKTREES_ENABLED=1`)
+  - Resource (MCP): `resource://identity/%2Fabs%2Fpath` (absolute paths must be URL-encoded inside the resource segment)
   - CLI (diagnostics): `mcp-agent-mail mail status /abs/path`
 
 - Precedence (when gate is on):
@@ -1871,6 +1875,7 @@ Consolidate legacy per-worktree projects into a canonical one (safe, explicit, a
   - Example: `mcp-agent-mail amctl env --path . --agent AliceDev`
 - `am-run` wraps a command with those keys set:
   - Example: `mcp-agent-mail am-run frontend-build -- npm run dev`
+  - Auth: when talking to the HTTP server, `am-run` now auto-loads the local agent `registration_token` from the database when possible. You can also pass `--registration-token` or set `AGENT_MAIL_REGISTRATION_TOKEN`.
 
 - Build slots (advisory, per-project coarse locking):
   - Flags:
@@ -1899,11 +1904,13 @@ Group multiple repositories (e.g., frontend, backend, infra) under a single prod
 - Inspect product and linked projects:
   - `mcp-agent-mail products status MyProduct`
 - Product‑wide message search (FTS):
-  - `mcp-agent-mail products search MyProduct "urgent AND deploy" --limit 50`
+  - `mcp-agent-mail products search MyProduct "urgent AND deploy" --agent Alice --registration-token "$AGENT_MAIL_REGISTRATION_TOKEN" --limit 50`
 - Product‑wide inbox:
-  - `mcp-agent-mail products inbox MyProduct Alice --limit 50 --urgent-only --include-bodies --since-ts "2025-11-01T00:00:00Z"`
+  - `mcp-agent-mail products inbox MyProduct Alice --registration-token "$AGENT_MAIL_REGISTRATION_TOKEN" --limit 50 --urgent-only --include-bodies --since-ts "2025-11-01T00:00:00Z"`
 - Product‑wide thread summarization:
-  - `mcp-agent-mail products summarize-thread MyProduct "bd-123" --per-thread-limit 100 --no-llm`
+  - `mcp-agent-mail products summarize-thread MyProduct "bd-123" --agent Alice --registration-token "$AGENT_MAIL_REGISTRATION_TOKEN" --per-thread-limit 100 --no-llm`
+- Auth note:
+  - Product-wide search, inbox, and thread summarization now require an authenticated agent identity. These commands accept `--registration-token` / `AGENT_MAIL_REGISTRATION_TOKEN` and will auto-use a single unambiguous locally stored token when that is possible.
 
 ## Containers
 
@@ -1926,6 +1933,7 @@ Group multiple repositories (e.g., frontend, backend, infra) under a single prod
   - The server reads config from `.env` via python-decouple. You can mount it read-only into the container at `/app/.env`.
   - Default bind host is `0.0.0.0` in the container; port `8765` is exposed.
   - Persistent archive lives under `/data/mailbox` (mapped to the `agent_mail_data` volume by default).
+  - **Bind-mount uid mismatches:** if you bind-mount a host directory (instead of a named volume) into `/data/mailbox`, the files on the host are typically owned by uid 1000 rather than the container's `appuser` (uid 10001). Git would normally refuse to operate on such a "dubious ownership" directory, which surfaces as the non-obvious error `Unknown parameter: --cached` on diff/status. The image now whitelists `/data/mailbox` (and, as a catch-all inside the container only, `*`) via `git config --global --add safe.directory`. If you rebuild from a fork that omits that step, either re-add the safe.directory lines or `chown -R 10001:10001` the host path (see issue #143).
 
 Notes
 - A unique `product_uid` is stored for each product; you can reference a product by uid or name.
@@ -2051,6 +2059,7 @@ Common variables you may set:
 | `INLINE_IMAGE_MAX_BYTES` | `65536` | Threshold (bytes) for inlining WebP images during send_message |
 | `CONVERT_IMAGES` | `true` | Convert images to WebP (and optionally inline small ones) |
 | `KEEP_ORIGINAL_IMAGES` | `false` | Also store original image bytes alongside WebP (attachments/originals/) |
+| `ALLOW_ABSOLUTE_ATTACHMENT_PATHS` | `false` | Allow absolute filesystem paths in attachments and markdown image references. Keep this disabled on networked deployments unless you explicitly want server-side file reads. |
 | `LOG_LEVEL` | `INFO` | Server log level |
 | `HTTP_CORS_ENABLED` | `false` | Enable CORS middleware when true |
 | `HTTP_CORS_ORIGINS` |  | CSV of allowed origins (e.g., `https://app.example.com,https://ops.example.com`) |
@@ -2092,7 +2101,8 @@ Common variables you may set:
 | `ACK_ESCALATION_CLAIM_EXCLUSIVE` | `false` | Make escalation file reservation exclusive |
 | `ACK_ESCALATION_CLAIM_HOLDER_NAME` |  | Ops agent name to own escalation file reservations |
 | `CONTACT_ENFORCEMENT_ENABLED` | `true` | Enforce contact policy before messaging |
-| `CONTACT_AUTO_TTL_SECONDS` | `86400` | TTL for auto-approved contacts (1 day) |
+| `CONTACT_AUTO_TTL_SECONDS` | `86400` | TTL for in-session auto-approved contact links and the "recent contact" recency window (1 day) |
+| `CONTACT_PENDING_TTL_SECONDS` | `604800` | TTL for the *pending* contact-request fallback created by `send_message(auto_contact_if_blocked=True)` when in-session auto-approval is not possible — i.e. how long an async human approver has to respond (7 days) |
 | `CONTACT_AUTO_RETRY_ENABLED` | `true` | Auto-retry contact requests on policy violations |
 | `MESSAGING_AUTO_REGISTER_RECIPIENTS` | `true` | Automatically create missing local recipients during `send_message` and retry routing |
 | `MESSAGING_AUTO_HANDSHAKE_ON_BLOCK` | `true` | When contact policy blocks delivery, attempt a contact handshake (auto-accept) and retry |
@@ -2273,34 +2283,34 @@ Output format (all tools/resources):
 | `register_agent` | `register_agent(project_key: str, program: str, model: str, name?: str, task_description?: str, attachments_policy?: str)` | Agent profile dict | Creates/updates agent; writes profile to Git |
 | `whois` | `whois(project_key: str, agent_name: str, include_recent_commits?: bool, commit_limit?: int)` | Agent profile dict | Enriched profile for one agent (optionally includes recent commits) |
 | `create_agent_identity` | `create_agent_identity(project_key: str, program: str, model: str, name_hint?: str, task_description?: str, attachments_policy?: str)` | Agent profile dict | Always creates a new unique agent |
-| `send_message` | `send_message(project_key: str, sender_name: str, to: list[str], subject: str, body_md: str, cc?: list[str], bcc?: list[str], attachment_paths?: list[str], convert_images?: bool, importance?: str, ack_required?: bool, thread_id?: str, auto_contact_if_blocked?: bool)` | `{deliveries: list, count: int, attachments?}` | Writes canonical + inbox/outbox, converts images. Non-absolute `attachment_paths` resolve relative to the project archive root. |
-| `reply_message` | `reply_message(project_key: str, message_id: int, sender_name: str, body_md: str, to?: list[str], cc?: list[str], bcc?: list[str], subject_prefix?: str)` | `{thread_id, reply_to, deliveries: list, count: int, attachments?}` | Preserves/creates thread, inherits flags |
-| `request_contact` | `request_contact(project_key: str, from_agent: str, to_agent: str, to_project?: str, reason?: str, ttl_seconds?: int)` | Contact link dict | Request permission to message another agent |
-| `respond_contact` | `respond_contact(project_key: str, to_agent: str, from_agent: str, accept: bool, from_project?: str, ttl_seconds?: int)` | Contact link dict | Approve or deny a contact request |
-| `list_contacts` | `list_contacts(project_key: str, agent_name: str)` | `list[dict]` | List contact links for an agent |
-| `set_contact_policy` | `set_contact_policy(project_key: str, agent_name: str, policy: str)` | Agent dict | Set policy: `open`, `auto`, `contacts_only`, `block_all` |
-| `fetch_inbox` | `fetch_inbox(project_key: str, agent_name: str, limit?: int, urgent_only?: bool, include_bodies?: bool, since_ts?: str)` | `list[dict]` | Non-mutating inbox read |
-| `mark_message_read` | `mark_message_read(project_key: str, agent_name: str, message_id: int)` | `{message_id, read, read_at}` | Per-recipient read receipt |
-| `acknowledge_message` | `acknowledge_message(project_key: str, agent_name: str, message_id: int)` | `{message_id, acknowledged, acknowledged_at, read_at}` | Sets ack and read |
-| `macro_start_session` | `macro_start_session(human_key: str, program: str, model: str, task_description?: str, agent_name?: str, file_reservation_paths?: list[str], file_reservation_reason?: str, file_reservation_ttl_seconds?: int, inbox_limit?: int)` | `{project, agent, file_reservations, inbox}` | Orchestrates ensure→register→optional file reservation→inbox fetch |
-| `macro_prepare_thread` | `macro_prepare_thread(project_key: str, thread_id: str, program: str, model: str, agent_name?: str, task_description?: str, register_if_missing?: bool, include_examples?: bool, inbox_limit?: int, include_inbox_bodies?: bool, llm_mode?: bool, llm_model?: str)` | `{project, agent, thread, inbox}` | Bundles registration, thread summary, and inbox context |
-| `macro_file_reservation_cycle` | `macro_file_reservation_cycle(project_key: str, agent_name: str, paths: list[str], ttl_seconds?: int, exclusive?: bool, reason?: str, auto_release?: bool)` | `{file_reservations, released}` | File Reservation + optionally release surfaces around a focused edit block |
-| `macro_contact_handshake` | `macro_contact_handshake(project_key: str, requester|agent_name: str, target|to_agent: str, to_project?: str, reason?: str, ttl_seconds?: int, auto_accept?: bool, welcome_subject?: str, welcome_body?: str)` | `{request, response, welcome_message}` | Automates contact request/approval and optional welcome ping |
-| `search_messages` | `search_messages(project_key: str, query: str, limit?: int)` | `list[dict]` | FTS5 search (bm25) |
-| `summarize_thread` | `summarize_thread(project_key: str, thread_id: str, include_examples?: bool, llm_mode?: bool, llm_model?: str, per_thread_limit?: int)` | Single: `{thread_id, summary, examples}` Multi (comma-sep): `{threads[], aggregate}` | Extracts participants, key points, actions. Use comma-separated thread_id for multi-thread digest. |
+| `send_message` | `send_message(project_key: str, sender_name: str, to: list[str], subject: str, body_md: str, cc?: list[str], bcc?: list[str], attachment_paths?: list[str], convert_images?: bool, importance?: str, ack_required?: bool, thread_id?: str, auto_contact_if_blocked?: bool, sender_token?: str)` | `{deliveries: list, count: int, attachments?}` | Writes canonical + inbox/outbox, converts images. Non-absolute `attachment_paths` resolve relative to the project archive root. |
+| `reply_message` | `reply_message(project_key: str, message_id: int, sender_name: str, body_md: str, to?: list[str], cc?: list[str], bcc?: list[str], subject_prefix?: str, sender_token?: str)` | `{thread_id, reply_to, deliveries: list, count: int, attachments?}` | Preserves/creates thread, inherits flags |
+| `request_contact` | `request_contact(project_key: str, from_agent: str, to_agent: str, to_project?: str, reason?: str, ttl_seconds?: int, registration_token?: str)` | Contact link dict | Request permission to message another agent |
+| `respond_contact` | `respond_contact(project_key: str, to_agent: str, from_agent: str, accept: bool, from_project?: str, ttl_seconds?: int, registration_token?: str)` | Contact link dict | Approve or deny a contact request |
+| `list_contacts` | `list_contacts(project_key: str, agent_name: str, registration_token?: str)` | `list[dict]` | List outbound contact links with target-project and expiry audit metadata |
+| `set_contact_policy` | `set_contact_policy(project_key: str, agent_name: str, policy: str, registration_token?: str)` | Agent dict | Set policy: `open`, `auto`, `contacts_only`, `block_all` |
+| `fetch_inbox` | `fetch_inbox(project_key: str, agent_name: str, limit?: int, urgent_only?: bool, include_bodies?: bool, since_ts?: str, topic?: str, unread_only?: bool, registration_token?: str)` | `list[dict]` | Non-mutating inbox read. `unread_only=true` filters to messages where this recipient's `read_ts` is NULL. |
+| `mark_message_read` | `mark_message_read(project_key: str, agent_name: str, message_id: int, registration_token?: str)` | `{message_id, read, read_at}` | Per-recipient read receipt |
+| `acknowledge_message` | `acknowledge_message(project_key: str, agent_name: str, message_id: int, registration_token?: str)` | `{message_id, acknowledged, acknowledged_at, read_at}` | Sets ack and read |
+| `macro_start_session` | `macro_start_session(human_key: str, program: str, model: str, task_description?: str, agent_name?: str, registration_token?: str, file_reservation_paths?: list[str], file_reservation_reason?: str, file_reservation_ttl_seconds?: int, inbox_limit?: int)` | `{project, agent, file_reservations, inbox}` | Orchestrates ensure→register→optional file reservation→inbox fetch |
+| `macro_prepare_thread` | `macro_prepare_thread(project_key: str, thread_id: str, program: str, model: str, agent_name?: str, registration_token?: str, task_description?: str, register_if_missing?: bool, include_examples?: bool, inbox_limit?: int, include_inbox_bodies?: bool, llm_mode?: bool, llm_model?: str)` | `{project, agent, thread, inbox}` | Bundles registration, thread summary, and inbox context |
+| `macro_file_reservation_cycle` | `macro_file_reservation_cycle(project_key: str, agent_name: str, paths: list[str], ttl_seconds?: int, exclusive?: bool, reason?: str, auto_release?: bool, registration_token?: str)` | `{file_reservations, released}` | File Reservation + optionally release surfaces around a focused edit block |
+| `macro_contact_handshake` | `macro_contact_handshake(project_key: str, requester|agent_name: str, target|to_agent: str, to_project?: str, reason?: str, ttl_seconds?: int, auto_accept?: bool, welcome_subject?: str, welcome_body?: str, requester_registration_token?: str, target_registration_token?: str)` | `{request, response, welcome_message}` | Automates contact request/approval and optional welcome ping |
+| `search_messages` | `search_messages(project_key: str, query: str, limit?: int, agent_name?: str, registration_token?: str)` | `list[dict]` | FTS5 search (bm25) scoped to the authenticated agent's visible messages |
+| `summarize_thread` | `summarize_thread(project_key: str, thread_id: str, include_examples?: bool, llm_mode?: bool, llm_model?: str, per_thread_limit?: int, agent_name?: str, registration_token?: str)` | Single: `{thread_id, summary, examples}` Multi (comma-sep): `{threads[], aggregate}` | Extracts participants, key points, actions. Use comma-separated thread_id for multi-thread digest. |
 | `install_precommit_guard` | `install_precommit_guard(project_key: str, code_repo_path: str)` | `{hook}` | Install a Git pre-commit guard in a target repo |
 | `uninstall_precommit_guard` | `uninstall_precommit_guard(code_repo_path: str)` | `{removed}` | Remove the guard from a repo |
-| `file_reservation_paths` | `file_reservation_paths(project_key: str, agent_name: str, paths: list[str], ttl_seconds?: int, exclusive?: bool, reason?: str)` | `{granted: list, conflicts: list}` | Advisory leases; Git artifact per path |
-| `release_file_reservations` | `release_file_reservations(project_key: str, agent_name: str, paths?: list[str], file_reservation_ids?: list[int])` | `{released, released_at}` | Releases agent's active file reservations |
-| `force_release_file_reservation` | `force_release_file_reservation(project_key: str, agent_name: str, file_reservation_id: int, notify_previous?: bool, note?: str)` | `{released, released_at, reservation}` | Clears stale reservations using inactivity/mail/fs/git heuristics and notifies the previous holder |
-| `renew_file_reservations` | `renew_file_reservations(project_key: str, agent_name: str, extend_seconds?: int, paths?: list[str], file_reservation_ids?: list[int])` | `{renewed, file reservations[]}` | Extend TTL of existing file reservations |
+| `file_reservation_paths` | `file_reservation_paths(project_key: str, agent_name: str, paths: list[str], ttl_seconds?: int, exclusive?: bool, reason?: str, registration_token?: str)` | `{granted: list, conflicts: list}` | Advisory leases; Git artifact per path |
+| `release_file_reservations` | `release_file_reservations(project_key: str, agent_name: str, paths?: list[str], file_reservation_ids?: list[int], registration_token?: str)` | `{released, released_at}` | Releases agent's active file reservations |
+| `force_release_file_reservation` | `force_release_file_reservation(project_key: str, agent_name: str, file_reservation_id: int, notify_previous?: bool, note?: str, registration_token?: str)` | `{released, released_at, reservation}` | Clears stale reservations using inactivity/mail/fs/git heuristics and notifies the previous holder |
+| `renew_file_reservations` | `renew_file_reservations(project_key: str, agent_name: str, extend_seconds?: int, paths?: list[str], file_reservation_ids?: list[int], registration_token?: str)` | `{renewed, file reservations[]}` | Extend TTL of existing file reservations |
 
 ### Resources
 
 Output format (resources):
 - Append `?format=toon` to any resource URI to receive `{format:"toon", data:"<TOON>", meta:{...}}`.
 - All resources declare `format` as an optional query parameter (FastMCP templates accept it).
-- For resources without path params (e.g., `resource://projects`), include `?format=json` or `?format=toon`.
+- For resources without variable path params (e.g., `resource://tooling/projects`), include `?format=json` or `?format=toon`.
 - Defaults to JSON unless `MCP_AGENT_MAIL_OUTPUT_FORMAT` or `TOON_DEFAULT_FORMAT` is set.
 
 | URI | Params | Returns | Notes |
@@ -2312,19 +2322,19 @@ Output format (resources):
 | `resource://tooling/locks{?format}` | — | `{locks[], summary}` | Active locks and owners (debug only). Categories: `archive` (per-project `.archive.lock`) and `custom` (e.g., repo `.commit.lock`). |
 | `resource://tooling/capabilities/{agent}{?project}` | listed| `{generated_at, agent, project, capabilities[]}` | Capabilities assigned to the agent (see `deploy/capabilities/agent_capabilities.json`) |
 | `resource://tooling/recent/{window_seconds}{?agent,project}` | listed | `{generated_at, window_seconds, count, entries[]}` | Recent tool usage filtered by agent/project |
-| `resource://projects{?format}` | — | `list[project]` | All projects |
+| `resource://tooling/projects{?format}` | — | `list[project]` | All projects |
 | `resource://project/{slug}` | `slug` | `{project..., agents[]}` | Project detail + agents |
 | `resource://file_reservations/{slug}{?active_only}` | `slug`, `active_only?` | `list[file reservation]` | File reservations plus staleness metadata (heuristics, last activity timestamps) |
-| `resource://message/{id}{?project}` | `id`, `project` | `message` | Single message with body |
-| `resource://thread/{thread_id}{?project,include_bodies}` | `thread_id`, `project`, `include_bodies?` | `{project, thread_id, messages[]}` | Thread listing |
-| `resource://inbox/{agent}{?project,since_ts,urgent_only,include_bodies,limit}` | listed | `{project, agent, count, messages[]}` | Inbox listing |
-| `resource://mailbox/{agent}{?project,limit}` | `project`, `limit` | `{project, agent, count, messages[]}` | Mailbox listing (recent messages with basic commit ref) |
-| `resource://mailbox-with-commits/{agent}{?project,limit}` | `project`, `limit` | `{project, agent, count, messages[]}` | Mailbox listing enriched with commit metadata |
-| `resource://outbox/{agent}{?project,limit,include_bodies,since_ts}` | listed | `{project, agent, count, messages[]}` | Messages sent by the agent |
-| `resource://views/acks-stale/{agent}{?project,ttl_seconds,limit}` | listed | `{project, agent, ttl_seconds, count, messages[]}` | Ack-required older than TTL without ack |
-| `resource://views/urgent-unread/{agent}{?project,limit}` | listed | `{project, agent, count, messages[]}` | High/urgent importance messages not yet read |
-| `resource://views/ack-required/{agent}{?project,limit}` | listed | `{project, agent, count, messages[]}` | Pending acknowledgements for an agent |
-| `resource://views/ack-overdue/{agent}{?project,ttl_minutes,limit}` | listed | `{project, agent, ttl_minutes, count, messages[]}` | Ack-required older than TTL without ack |
+| `resource://message/{id}{?project,agent,agent_token}` | `id`, `project`, `agent?`, `agent_token?` | `message` | Single message with body; provide agent auth unless this MCP session already authenticated for the project |
+| `resource://thread/{thread_id}{?project,agent,agent_token,include_bodies}` | `thread_id`, `project`, `agent?`, `agent_token?`, `include_bodies?` | `{project, thread_id, messages[]}` | Thread listing scoped to the authenticated viewer |
+| `resource://inbox/{agent}{?project,since_ts,urgent_only,include_bodies,limit,agent_token}` | listed | `{project, agent, count, messages[]}` | Inbox listing |
+| `resource://mailbox/{agent}{?project,limit,agent_token}` | `project`, `limit`, `agent_token?` | `{project, agent, count, messages[]}` | Mailbox listing |
+| `resource://mailbox-with-commits/{agent}{?project,limit,agent_token}` | `project`, `limit`, `agent_token?` | `{project, agent, count, messages[]}` | Mailbox listing enriched with commit metadata |
+| `resource://outbox/{agent}{?project,limit,include_bodies,since_ts,agent_token}` | listed | `{project, agent, count, messages[]}` | Messages sent by the agent |
+| `resource://views/acks-stale/{agent}{?project,ttl_seconds,limit,agent_token}` | listed | `{project, agent, ttl_seconds, count, messages[]}` | Ack-required older than TTL without ack |
+| `resource://views/urgent-unread/{agent}{?project,limit,agent_token}` | listed | `{project, agent, count, messages[]}` | High/urgent importance messages not yet read |
+| `resource://views/ack-required/{agent}{?project,limit,agent_token}` | listed | `{project, agent, count, messages[]}` | Pending acknowledgements for an agent |
+| `resource://views/ack-overdue/{agent}{?project,ttl_minutes,limit,agent_token}` | listed | `{project, agent, ttl_minutes, count, messages[]}` | Ack-required older than TTL without ack |
 
 ### Client Integration Guide
 
@@ -2374,9 +2384,9 @@ Operations teams can follow `docs/operations_alignment_checklist.md`, which link
 
 ## Deployment quick notes
 
-- **Direct uvicorn**: `uvicorn mcp_agent_mail.http:build_http_app --factory --host 0.0.0.0 --port 8765`
+- **Direct uvicorn**: `uvicorn mcp_agent_mail.http:create_app --factory --host 0.0.0.0 --port 8765`
 - **Python module**: `python -m mcp_agent_mail.http --host 0.0.0.0 --port 8765`
-- **Gunicorn**: `gunicorn -c deploy/gunicorn.conf.py mcp_agent_mail.http:build_http_app --factory`
+- **Gunicorn**: `gunicorn -c deploy/gunicorn.conf.py mcp_agent_mail.http:create_app --factory`
 - **Docker**: `docker compose up --build`
 
 ### CI/CD
@@ -2432,7 +2442,7 @@ sudo systemctl status mcp-agent-mail
 
 Optional (non-journald log rotation): install `deploy/logrotate/mcp-agent-mail` into `/etc/logrotate.d/` and write logs to `/var/log/mcp-agent-mail/*.log` via your process manager or app config.
 
-See `deploy/gunicorn.conf.py` for a starter configuration. For project direction and planned areas, read `project_idea_and_guide.md`.
+See `deploy/gunicorn.conf.py` for a starter configuration. For project direction and planned areas, read `docs/planning/project_idea_and_guide.md`.
 
 ## CLI Commands
 

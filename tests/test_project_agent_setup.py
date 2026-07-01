@@ -20,9 +20,12 @@ Reference: mcp_agent_mail-mm2
 from __future__ import annotations
 
 import asyncio
+import threading
+from pathlib import Path
 
 import pytest
 from fastmcp import Client
+from fastmcp.exceptions import ToolError
 from sqlalchemy import text
 from sqlmodel import select
 
@@ -301,6 +304,58 @@ async def test_register_agent_updates_existing_agent(isolated_env):
 
 
 @pytest.mark.asyncio
+async def test_register_agent_existing_identity_requires_token_across_sessions(isolated_env):
+    """A new session cannot take over an existing named agent without its token."""
+    server = build_mcp_server()
+    async with Client(server) as bootstrap_client:
+        await bootstrap_client.call_tool("ensure_project", {"human_key": "/test/setup/takeover"})
+        created = await bootstrap_client.call_tool(
+            "register_agent",
+            {
+                "project_key": "/test/setup/takeover",
+                "program": "bootstrap-program",
+                "model": "bootstrap-model",
+                "name": "BlueLake",
+                "task_description": "Original owner",
+            },
+        )
+        registration_token = created.data["registration_token"]
+
+    async with Client(server) as attacker_client:
+        with pytest.raises(ToolError) as exc_info:
+            await attacker_client.call_tool(
+                "register_agent",
+                {
+                    "project_key": "/test/setup/takeover",
+                    "program": "attacker-program",
+                    "model": "attacker-model",
+                    "name": "BlueLake",
+                    "task_description": "Hijacked",
+                },
+            )
+        assert "registration_token" in str(exc_info.value)
+
+    project = await get_project_from_db("/test/setup/takeover")
+    assert project is not None
+    assert await count_agents_in_project(project["id"]) == 1
+
+    async with Client(server) as owner_client:
+        updated = await owner_client.call_tool(
+            "register_agent",
+            {
+                "project_key": "/test/setup/takeover",
+                "program": "bootstrap-program",
+                "model": "bootstrap-model",
+                "name": "BlueLake",
+                "task_description": "Updated by owner",
+                "registration_token": registration_token,
+            },
+        )
+    assert updated.data["name"] == "BlueLake"
+    assert updated.data["task_description"] == "Updated by owner"
+
+
+@pytest.mark.asyncio
 async def test_register_agent_generates_valid_name(isolated_env):
     """register_agent generates valid adjective+noun names."""
     server = build_mcp_server()
@@ -397,6 +452,40 @@ async def test_create_agent_identity_with_name_hint(isolated_env):
 
         # Should use the hint
         assert result.data["name"] == "GreenCastle"
+
+
+@pytest.mark.asyncio
+async def test_create_agent_identity_offloads_archive_name_check(isolated_env, monkeypatch):
+    """Archive-side name availability checks should not block the event loop."""
+    main_thread = threading.main_thread()
+    path_type = type(Path("/"))
+    original_exists = path_type.exists
+    seen_archive_exists = False
+
+    def checked_exists(self: Path) -> bool:
+        nonlocal seen_archive_exists
+        if self.name == "BlueRiver" and "agents" in self.parts:
+            seen_archive_exists = True
+            assert threading.current_thread() is not main_thread
+        return original_exists(self)
+
+    monkeypatch.setattr(path_type, "exists", checked_exists)
+
+    server = build_mcp_server()
+    async with Client(server) as client:
+        await client.call_tool("ensure_project", {"human_key": "/test/setup/hint-offload"})
+        result = await client.call_tool(
+            "create_agent_identity",
+            {
+                "project_key": "/test/setup/hint-offload",
+                "program": "test",
+                "model": "test",
+                "name_hint": "BlueRiver",
+            },
+        )
+
+    assert result.data["name"] == "BlueRiver"
+    assert seen_archive_exists is True
 
 
 # ============================================================================

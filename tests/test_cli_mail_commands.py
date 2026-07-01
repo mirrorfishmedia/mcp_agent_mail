@@ -13,11 +13,15 @@ Reference: mcp_agent_mail-n6z
 from __future__ import annotations
 
 import asyncio
+import subprocess
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 
 from typer.testing import CliRunner
 
+from mcp_agent_mail.app import _compute_project_slug, _resolve_project_identity
 from mcp_agent_mail.cli import app
+from mcp_agent_mail.config import get_settings
 from mcp_agent_mail.db import ensure_schema, get_session
 from mcp_agent_mail.models import Agent, Message, MessageRecipient, Project
 
@@ -37,6 +41,7 @@ async def seed_project_with_agents() -> tuple[Project, Agent, Agent]:
         session.add(project)
         await session.commit()
         await session.refresh(project)
+        assert project.id is not None
 
         sender = Agent(
             project_id=project.id,
@@ -57,6 +62,8 @@ async def seed_project_with_agents() -> tuple[Project, Agent, Agent]:
         await session.commit()
         await session.refresh(sender)
         await session.refresh(receiver)
+        assert sender.id is not None
+        assert receiver.id is not None
 
         return project, sender, receiver
 
@@ -71,6 +78,9 @@ async def seed_message_with_ack(
     acknowledged: bool = False,
 ) -> Message:
     """Create a message with optional acknowledgement state."""
+    assert project.id is not None
+    assert sender.id is not None
+    assert receiver.id is not None
     async with get_session() as session:
         created_ts = datetime.now(timezone.utc) - timedelta(minutes=created_offset_minutes)
         # Convert to naive for SQLite
@@ -88,6 +98,7 @@ async def seed_message_with_ack(
         session.add(message)
         await session.commit()
         await session.refresh(message)
+        assert message.id is not None
 
         recipient = MessageRecipient(
             message_id=message.id,
@@ -120,8 +131,6 @@ def test_mail_status_basic(isolated_env, tmp_path, monkeypatch):
 
 def test_mail_status_with_git_repo(isolated_env, tmp_path):
     """mail status shows git-related info when in a git repo."""
-    import subprocess
-
     # Initialize a git repo
     repo_dir = tmp_path / "git_repo"
     repo_dir.mkdir()
@@ -149,6 +158,29 @@ def test_mail_status_with_git_repo(isolated_env, tmp_path):
     assert "path" in result.stdout
 
 
+def test_mail_status_uses_repo_root_identity_for_subdirectory_path(isolated_env, tmp_path, monkeypatch):
+    """mail status should report repo-root identity when pointed at a nested path inside a git repo."""
+    monkeypatch.setenv("WORKTREES_ENABLED", "0")
+    get_settings.cache_clear()
+
+    repo_dir = tmp_path / "git_repo_subdir"
+    subdir = repo_dir / "nested" / "work"
+    subdir.mkdir(parents=True)
+    subprocess.run(["git", "init"], cwd=str(repo_dir), check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    subprocess.run(["git", "config", "user.email", "test@example.com"], cwd=str(repo_dir), check=True)
+    subprocess.run(["git", "config", "user.name", "Test"], cwd=str(repo_dir), check=True)
+
+    root_ident = _resolve_project_identity(str(repo_dir))
+    subdir_ident = _resolve_project_identity(str(subdir))
+    assert root_ident["slug"] != subdir_ident["slug"]
+
+    result = runner.invoke(app, ["mail", "status", str(subdir)])
+
+    assert result.exit_code == 0
+    assert root_ident["slug"] in result.stdout
+    assert str(Path(repo_dir)) in result.stdout
+
+
 def test_mail_status_shows_identity_mode(isolated_env, tmp_path):
     """mail status displays PROJECT_IDENTITY_MODE setting."""
     test_dir = tmp_path / "test"
@@ -157,6 +189,25 @@ def test_mail_status_shows_identity_mode(isolated_env, tmp_path):
     result = runner.invoke(app, ["mail", "status", str(test_dir)])
     assert result.exit_code == 0
     assert "PROJECT_IDENTITY_MODE" in result.stdout
+
+
+def test_mail_status_preserves_symlink_project_identity(isolated_env, tmp_path, monkeypatch):
+    """mail status should not collapse symlinked project paths in dir mode."""
+    monkeypatch.setenv("WORKTREES_ENABLED", "1")
+    monkeypatch.setenv("PROJECT_IDENTITY_MODE", "dir")
+    monkeypatch.setenv("COLUMNS", "240")
+    get_settings.cache_clear()
+
+    real_dir = tmp_path / "real-repo"
+    real_dir.mkdir()
+    symlink_dir = tmp_path / "repo-link"
+    symlink_dir.symlink_to(real_dir, target_is_directory=True)
+
+    result = runner.invoke(app, ["mail", "status", str(symlink_dir)])
+
+    assert result.exit_code == 0
+    assert _compute_project_slug(str(symlink_dir)) in result.stdout
+    assert str(symlink_dir) in result.stdout
 
 
 # ============================================================================
@@ -534,6 +585,9 @@ def test_acks_pending_shows_message_details(isolated_env):
     project, sender, receiver = asyncio.run(seed_project_with_agents())
 
     async def create_with_thread():
+        assert project.id is not None
+        assert sender.id is not None
+        assert receiver.id is not None
         async with get_session() as session:
             message = Message(
                 project_id=project.id,
@@ -547,6 +601,7 @@ def test_acks_pending_shows_message_details(isolated_env):
             session.add(message)
             await session.commit()
             await session.refresh(message)
+            assert message.id is not None
             session.add(
                 MessageRecipient(message_id=message.id, agent_id=receiver.id, kind="cc")
             )
@@ -568,6 +623,9 @@ def test_acks_remind_read_status_indicator(isolated_env):
     project, sender, receiver = asyncio.run(seed_project_with_agents())
 
     async def create_read_message():
+        assert project.id is not None
+        assert sender.id is not None
+        assert receiver.id is not None
         async with get_session() as session:
             message = Message(
                 project_id=project.id,
@@ -582,6 +640,7 @@ def test_acks_remind_read_status_indicator(isolated_env):
             session.add(message)
             await session.commit()
             await session.refresh(message)
+            assert message.id is not None
             session.add(
                 MessageRecipient(
                     message_id=message.id,
@@ -608,6 +667,9 @@ def test_multiple_recipients_handled(isolated_env):
     project, sender, receiver = asyncio.run(seed_project_with_agents())
 
     async def create_multi_recipient():
+        assert project.id is not None
+        assert sender.id is not None
+        assert receiver.id is not None
         async with get_session() as session:
             # Create another agent
             other = Agent(
@@ -620,6 +682,7 @@ def test_multiple_recipients_handled(isolated_env):
             session.add(other)
             await session.commit()
             await session.refresh(other)
+            assert other.id is not None
 
             message = Message(
                 project_id=project.id,
@@ -632,6 +695,7 @@ def test_multiple_recipients_handled(isolated_env):
             session.add(message)
             await session.commit()
             await session.refresh(message)
+            assert message.id is not None
 
             # Add multiple recipients
             session.add(
@@ -661,8 +725,8 @@ def test_multiple_recipients_handled(isolated_env):
     assert "Multi Recipient" in result.stdout
 
 
-def test_acks_commands_exact_agent_name(isolated_env):
-    """Agent names are matched exactly (case-sensitive)."""
+def test_acks_commands_resolve_agent_name_case_insensitively(isolated_env):
+    """Agent names should resolve case-insensitively for ack commands."""
     project, sender, receiver = asyncio.run(seed_project_with_agents())
     asyncio.run(seed_message_with_ack(project, sender, receiver, "Case Test"))
 
@@ -674,9 +738,10 @@ def test_acks_commands_exact_agent_name(isolated_env):
     assert result.exit_code == 0
     assert "Case Test" in result.stdout
 
-    # Wrong case should fail (agent names are case-sensitive)
+    # Wrong case should resolve to the same agent record.
     result = runner.invoke(
         app,
         ["acks", "pending", project.human_key, receiver.name.upper()],
     )
-    assert result.exit_code != 0  # Agent not found
+    assert result.exit_code == 0
+    assert "Case Test" in result.stdout

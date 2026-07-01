@@ -46,19 +46,9 @@ if [[ -z "${_HTTP_HOST}" || -z "${_HTTP_PORT}" || -z "${_HTTP_PATH}" ]]; then
 fi
 
 _URL="http://${_HTTP_HOST}:${_HTTP_PORT}${_HTTP_PATH}"
-_TOKEN="${INTEGRATION_BEARER_TOKEN:-}"
-if [[ -z "${_TOKEN}" && -f .env ]]; then
-  _TOKEN=$(grep -E '^HTTP_BEARER_TOKEN=' .env | sed -E 's/^HTTP_BEARER_TOKEN=//') || true
-fi
+_TOKEN="$(resolve_integration_bearer_token "${ROOT_DIR}")"
 if [[ -z "${_TOKEN}" ]]; then
-  if command -v openssl >/dev/null 2>&1; then
-    _TOKEN=$(openssl rand -hex 32)
-  else
-    _TOKEN=$(uv run python - <<'PY'
-import secrets; print(secrets.token_hex(32))
-PY
-)
-  fi
+  _TOKEN="$(generate_bearer_token)"
   log_ok "Generated bearer token."
 fi
 
@@ -83,34 +73,11 @@ JSON
 json_validate "$OUT_JSON" || true
 set_secure_file "$OUT_JSON"
 
-log_step "Creating run helper script"
+log_step "Creating run helper script (centralized in lib.sh)"
 mkdir -p scripts
 RUN_HELPER="scripts/run_server_with_token.sh"
 if [[ ! -f "$RUN_HELPER" ]]; then
-  write_atomic "$RUN_HELPER" <<'SH'
-#!/usr/bin/env bash
-set -euo pipefail
-
-if [[ -z "${HTTP_BEARER_TOKEN:-}" ]]; then
-  if [[ -f .env ]]; then
-    HTTP_BEARER_TOKEN=$(grep -E '^HTTP_BEARER_TOKEN=' .env | sed -E 's/^HTTP_BEARER_TOKEN=//') || true
-  fi
-fi
-if [[ -z "${HTTP_BEARER_TOKEN:-}" ]]; then
-  if command -v uv >/dev/null 2>&1; then
-    HTTP_BEARER_TOKEN=$(uv run python - <<'PY'
-import secrets; print(secrets.token_hex(32))
-PY
-)
-  else
-    HTTP_BEARER_TOKEN="$(date +%s)_$(hostname)"
-  fi
-fi
-export HTTP_BEARER_TOKEN
-
-uv run python -m mcp_agent_mail.cli serve-http "$@"
-SH
-  set_secure_exec "$RUN_HELPER"
+  write_run_helper_script "$RUN_HELPER"
 fi
 
 echo "Wrote ${OUT_JSON}."
@@ -172,17 +139,24 @@ else
       -d "{\"jsonrpc\":\"2.0\",\"id\":\"2\",\"method\":\"tools/call\",\"params\":{\"name\":\"register_agent\",\"arguments\":{\"project_key\":${_HUMAN_KEY_ESCAPED},\"program\":\"factory-droid\",\"model\":\"factory\",\"task_description\":\"setup\"}}}" \
       "${_URL}" 2>/dev/null || echo "")
 
+  _REG_TOKEN=""
   if [[ -n "${_REGISTER_RESPONSE}" ]]; then
-    # Extract agent name from JSON response using jq or Python
+    # Extract agent name + registration_token from JSON response using jq or Python
     if command -v jq >/dev/null 2>&1; then
       _AGENT=$(echo "${_REGISTER_RESPONSE}" | jq -r '.result.content[0].text // empty' 2>/dev/null | jq -r '.name // empty' 2>/dev/null || echo "")
+      _REG_TOKEN=$(echo "${_REGISTER_RESPONSE}" | jq -r '.result.content[0].text // empty' 2>/dev/null | jq -r '.registration_token // empty' 2>/dev/null || echo "")
     else
       _AGENT=$(echo "${_REGISTER_RESPONSE}" | uv run python -c 'import sys,json; r=json.load(sys.stdin); c=r.get("result",{}).get("content",[]); print(json.loads(c[0]["text"])["name"] if c else "")' 2>/dev/null || echo "")
+      _REG_TOKEN=$(echo "${_REGISTER_RESPONSE}" | uv run python -c 'import sys,json; r=json.load(sys.stdin); c=r.get("result",{}).get("content",[]); print(json.loads(c[0]["text"]).get("registration_token","") if c else "")' 2>/dev/null || echo "")
     fi
     if [[ -n "${_AGENT}" ]]; then
       log_ok "Registered agent: ${_AGENT}"
     else
       log_warn "Could not parse agent name from response"
+    fi
+    if [[ -z "${_REG_TOKEN}" ]]; then
+      log_warn "Could not parse registration_token from register_agent response."
+      log_warn "The inbox-check hook will silently no-op until this is set (fetch_inbox auth)."
     fi
   else
     log_warn "Failed to register agent"
@@ -209,11 +183,14 @@ else
   log_warn "Could not find check_inbox.sh hook script"
 fi
 
-# Build the inbox check command with environment variables
+# Build the inbox check command with environment variables.
+# AGENT_MAIL_REGISTRATION_TOKEN is required for fetch_inbox to authenticate
+# from a hook invocation (each hook fires its own curl POST and bypasses
+# any persistent MCP-session state).
 _PROJ_DISPLAY=$(basename "$TARGET_DIR")
 _PROJ="${TARGET_DIR}"
 _MCP_DIR="${ROOT_DIR}"
-INBOX_CHECK_CMD="AGENT_MAIL_PROJECT='${TARGET_DIR}' AGENT_MAIL_AGENT='${_AGENT}' AGENT_MAIL_URL='${_URL}' AGENT_MAIL_TOKEN='${_TOKEN}' AGENT_MAIL_INTERVAL='120' '${INBOX_HOOK}'"
+INBOX_CHECK_CMD="AGENT_MAIL_PROJECT='${TARGET_DIR}' AGENT_MAIL_AGENT='${_AGENT}' AGENT_MAIL_URL='${_URL}' AGENT_MAIL_TOKEN='${_TOKEN}' AGENT_MAIL_REGISTRATION_TOKEN='${_REG_TOKEN:-}' AGENT_MAIL_INTERVAL='120' '${INBOX_HOOK}'"
 
 log_step "Updating ~/.factory/settings.json with hooks and MCP config"
 HOME_SETTINGS="${HOME}/.factory/settings.json"

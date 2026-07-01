@@ -53,6 +53,7 @@ def run_precommit_script(
     repo_path: Path,
     agent_name: str | None = None,
     worktrees_enabled: str = "1",
+    git_identity_enabled: str = "0",
     bypass: str = "0",
     guard_mode: str = "block",
 ) -> subprocess.CompletedProcess:
@@ -63,6 +64,7 @@ def run_precommit_script(
     elif "AGENT_NAME" in env:
         del env["AGENT_NAME"]
     env["WORKTREES_ENABLED"] = worktrees_enabled
+    env["GIT_IDENTITY_ENABLED"] = git_identity_enabled
     env["AGENT_MAIL_BYPASS"] = bypass
     env["AGENT_MAIL_GUARD_MODE"] = guard_mode
     return subprocess.run(
@@ -236,6 +238,37 @@ async def test_precommit_ignores_expired_reservation(isolated_env, tmp_path: Pat
     assert proc.returncode == 0, f"Should ignore expired reservation, stderr: {proc.stderr}"
 
 
+@pytest.mark.asyncio
+async def test_precommit_ignores_released_reservation(isolated_env, tmp_path: Path):
+    """Pre-commit should ignore reservations that already have released_ts set."""
+    settings = get_settings()
+    archive = await ensure_archive(settings, "enforcement-test-released")
+    script_text = render_precommit_script(archive)
+    script_path = tmp_path / "precommit.py"
+    script_path.write_text(script_text, encoding="utf-8")
+
+    released_ts = datetime.now(timezone.utc).isoformat()
+    future_ts = (datetime.now(timezone.utc) + timedelta(hours=1)).isoformat()
+    await write_file_reservation_record(
+        archive,
+        {
+            "agent": "OtherAgent",
+            "path_pattern": "src/app.py",
+            "exclusive": True,
+            "released_ts": released_ts,
+            "expires_ts": future_ts,
+        },
+    )
+
+    code_repo = tmp_path / "code"
+    code_repo.mkdir(parents=True, exist_ok=True)
+    init_git_repo(code_repo)
+    stage_file(code_repo, "src/app.py")
+
+    proc = run_precommit_script(script_path, code_repo, agent_name="TestAgent")
+    assert proc.returncode == 0, f"Should ignore released reservation, stderr: {proc.stderr}"
+
+
 # ============================================================================
 # Test: Bypass Mode
 # ============================================================================
@@ -366,6 +399,40 @@ async def test_precommit_gate_disabled_exits_early(isolated_env, tmp_path: Path)
         script_path, code_repo, agent_name="TestAgent", worktrees_enabled="0"
     )
     assert proc.returncode == 0, f"Gate disabled should allow, stderr: {proc.stderr}"
+
+
+@pytest.mark.asyncio
+async def test_precommit_git_identity_gate_blocks_conflict(isolated_env, tmp_path: Path):
+    """GIT_IDENTITY_ENABLED=1 should enable enforcement even when WORKTREES_ENABLED=0."""
+    settings = get_settings()
+    archive = await ensure_archive(settings, "enforcement-test-git-identity")
+    script_text = render_precommit_script(archive)
+    script_path = tmp_path / "precommit.py"
+    script_path.write_text(script_text, encoding="utf-8")
+
+    await write_file_reservation_record(
+        archive,
+        {
+            "agent": "OtherAgent",
+            "path_pattern": "src/app.py",
+            "exclusive": True,
+        },
+    )
+
+    code_repo = tmp_path / "code"
+    code_repo.mkdir(parents=True, exist_ok=True)
+    init_git_repo(code_repo)
+    stage_file(code_repo, "src/app.py")
+
+    proc = run_precommit_script(
+        script_path,
+        code_repo,
+        agent_name="TestAgent",
+        worktrees_enabled="0",
+        git_identity_enabled="1",
+    )
+    assert proc.returncode == 1, f"GIT_IDENTITY_ENABLED should enforce conflicts, stderr: {proc.stderr}"
+    assert "conflict" in proc.stderr.lower()
 
 
 # ============================================================================

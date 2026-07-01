@@ -13,6 +13,7 @@ Reference: mcp_agent_mail-w51
 
 from __future__ import annotations
 
+import asyncio
 import base64
 import contextlib
 import json
@@ -202,6 +203,31 @@ class TestLocalhostBypass:
                 json=_rpc("tools/call", {"name": "health_check", "arguments": {}}),
             )
             assert response.status_code == 401
+
+    @pytest.mark.asyncio
+    async def test_ipv4_mapped_ipv6_localhost_bypass_allows_write_tools(
+        self, isolated_env, monkeypatch, tmp_path
+    ):
+        """IPv4-mapped localhost addresses should get the same write bypass as 127.0.0.1."""
+        monkeypatch.setenv("HTTP_BEARER_TOKEN", "secret-token")
+        monkeypatch.setenv("HTTP_ALLOW_LOCALHOST_UNAUTHENTICATED", "true")
+        with contextlib.suppress(Exception):
+            _config.clear_settings_cache()
+
+        settings = _config.get_settings()
+        server = build_mcp_server()
+        app = build_http_app(settings, server)
+
+        transport = ASGITransport(app=app, client=("::ffff:127.0.0.1", 12345))
+        async with AsyncClient(transport=transport, base_url="http://test") as client:
+            response = await client.post(
+                settings.http.path,
+                json=_rpc(
+                    "tools/call",
+                    {"name": "ensure_project", "arguments": {"human_key": str(tmp_path / "localhost-project")}},
+                ),
+            )
+            assert response.status_code == 200
 
 
 # =============================================================================
@@ -402,6 +428,59 @@ class TestOAuthMetadataEndpoints:
         transport = ASGITransport(app=app)
         async with AsyncClient(transport=transport, base_url="http://test") as client:
             response = await client.get("/.well-known/oauth-authorization-server/mcp")
+            assert response.status_code == 404
+            data = response.json()
+            assert data.get("mcp_oauth") is False
+
+    @pytest.mark.asyncio
+    async def test_oauth_metadata_prefixed_mount_returns_404(self, isolated_env):
+        """Mounted transport paths should not expose accidental OAuth metadata."""
+        settings = _config.get_settings()
+        server = build_mcp_server()
+        app = build_http_app(settings, server)
+
+        transport = ASGITransport(app=app)
+        async with AsyncClient(transport=transport, base_url="http://test") as client:
+            response = await client.get("/api/.well-known/oauth-authorization-server")
+            assert response.status_code == 404
+            data = response.json()
+            assert data.get("mcp_oauth") is False
+
+    @pytest.mark.asyncio
+    async def test_oauth_metadata_suffix_probe_returns_404(self, isolated_env):
+        """Codex-style suffix probes should also terminate OAuth discovery cleanly."""
+        settings = _config.get_settings()
+        server = build_mcp_server()
+        app = build_http_app(settings, server)
+
+        transport = ASGITransport(app=app)
+        async with AsyncClient(transport=transport, base_url="http://test") as client:
+            response = await client.get("/.well-known/oauth-authorization-server/api")
+            assert response.status_code == 404
+            data = response.json()
+            assert data.get("mcp_oauth") is False
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "path",
+        [
+            "/api/.well-known/oauth-authorization-server/",
+            "/api/.well-known/oauth-authorization-server/mcp/",
+            "/mcp/.well-known/oauth-authorization-server/",
+            "/mcp/.well-known/oauth-authorization-server/mcp/",
+        ],
+    )
+    async def test_oauth_metadata_prefixed_trailing_slash_paths_return_404(
+        self, isolated_env, path: str
+    ):
+        """Mounted trailing-slash probe paths should not fall through into the MCP transport."""
+        settings = _config.get_settings()
+        server = build_mcp_server()
+        app = build_http_app(settings, server)
+
+        transport = ASGITransport(app=app)
+        async with AsyncClient(transport=transport, base_url="http://test") as client:
+            response = await asyncio.wait_for(client.get(path), timeout=1.0)
             assert response.status_code == 404
             data = response.json()
             assert data.get("mcp_oauth") is False

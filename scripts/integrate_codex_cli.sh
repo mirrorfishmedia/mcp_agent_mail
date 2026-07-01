@@ -52,16 +52,9 @@ _URL="http://${_HTTP_HOST}:${_HTTP_PORT}${_HTTP_PATH}"
 log_ok "Detected MCP HTTP endpoint: ${_URL}"
 
 _TOKEN_GENERATED=0
-_TOKEN="${INTEGRATION_BEARER_TOKEN:-${_HTTP_BEARER_TOKEN:-}}"
+_TOKEN="$(resolve_integration_bearer_token "${ROOT_DIR}")"
 if [[ -z "${_TOKEN}" ]]; then
-  if command -v openssl >/dev/null 2>&1; then
-    _TOKEN=$(openssl rand -hex 32)
-  else
-    _TOKEN=$(uv run python - <<'PY'
-import secrets; print(secrets.token_hex(32))
-PY
-)
-  fi
+  _TOKEN="$(generate_bearer_token)"
   _TOKEN_GENERATED=1
   log_ok "Generated bearer token."
 fi
@@ -75,6 +68,14 @@ if [[ "${_TOKEN_GENERATED}" == "1" ]]; then
   fi
 fi
 
+_MORPH_ENABLED_TOOLS=$(default_morph_enabled_tools)
+_MORPH_API_KEY=$(resolve_morph_api_key)
+if [[ -n "${_MORPH_API_KEY}" ]]; then
+  log_ok "Morph MCP will be configured in grep-only mode."
+else
+  log_warn "Morph API key not found; skipping morph-mcp setup."
+fi
+
 OUT_JSON="${TARGET_DIR}/codex.mcp.json"
 backup_file "$OUT_JSON"
 log_step "Writing ${OUT_JSON}"
@@ -83,6 +84,21 @@ if [[ -n "${_TOKEN}" ]]; then
 else
   AUTH_HEADER_LINE=''
 fi
+MORPH_MCP_JSON=""
+if [[ -n "${_MORPH_API_KEY}" ]]; then
+  MORPH_MCP_JSON=$(cat <<JSONFRAG
+,
+    "morph-mcp": {
+      "command": "npx",
+      "args": ["-y", "@morphllm/morphmcp"],
+      "env": {
+        "ENABLED_TOOLS": "${_MORPH_ENABLED_TOOLS}",
+        "MORPH_API_KEY": "${_MORPH_API_KEY}"
+      }
+    }
+JSONFRAG
+)
+fi
 write_atomic "$OUT_JSON" <<JSON
 {
   "mcpServers": {
@@ -90,40 +106,17 @@ write_atomic "$OUT_JSON" <<JSON
       "type": "http",
       "url": "${_URL}",
       "headers": {${AUTH_HEADER_LINE}}
-    }
+    }${MORPH_MCP_JSON}
   }
 }
 JSON
 json_validate "$OUT_JSON" || true
 set_secure_file "$OUT_JSON"
 
-log_step "Creating run helper script"
+log_step "Creating run helper script (centralized in lib.sh)"
 mkdir -p scripts
 RUN_HELPER="scripts/run_server_with_token.sh"
-write_atomic "$RUN_HELPER" <<'SH'
-#!/usr/bin/env bash
-set -euo pipefail
-
-if [[ -z "${HTTP_BEARER_TOKEN:-}" ]]; then
-  if [[ -f .env ]]; then
-    HTTP_BEARER_TOKEN=$(grep -E '^HTTP_BEARER_TOKEN=' .env | sed -E 's/^HTTP_BEARER_TOKEN=//') || true
-  fi
-fi
-if [[ -z "${HTTP_BEARER_TOKEN:-}" ]]; then
-  if command -v uv >/dev/null 2>&1; then
-    HTTP_BEARER_TOKEN=$(uv run python - <<'PY'
-import secrets; print(secrets.token_hex(32))
-PY
-)
-  else
-    HTTP_BEARER_TOKEN="$(date +%s)_$(hostname)"
-  fi
-fi
-export HTTP_BEARER_TOKEN
-
-uv run python -m mcp_agent_mail.cli serve-http "$@"
-SH
-set_secure_exec "$RUN_HELPER"
+write_run_helper_script "$RUN_HELPER"
 
 log_step "Checking server and registering agent"
 _AGENT=""
@@ -153,17 +146,24 @@ if readiness_poll "${_HTTP_HOST}" "${_HTTP_PORT}" "/health/readiness" 3 0.5; the
       -d "{\"jsonrpc\":\"2.0\",\"id\":\"2\",\"method\":\"tools/call\",\"params\":{\"name\":\"register_agent\",\"arguments\":{\"project_key\":${_HUMAN_KEY_ESCAPED},\"program\":\"codex-cli\",\"model\":\"gpt-5-codex\",\"task_description\":\"setup\"}}}" \
       "${_URL}" 2>/dev/null || echo "")
 
+  _REG_TOKEN=""
   if [[ -n "${_REGISTER_RESPONSE}" ]]; then
-    # Extract agent name from JSON response using jq or Python
+    # Extract agent name + registration_token from JSON response using jq or Python
     if command -v jq >/dev/null 2>&1; then
       _AGENT=$(echo "${_REGISTER_RESPONSE}" | jq -r '.result.content[0].text // empty' 2>/dev/null | jq -r '.name // empty' 2>/dev/null || echo "")
+      _REG_TOKEN=$(echo "${_REGISTER_RESPONSE}" | jq -r '.result.content[0].text // empty' 2>/dev/null | jq -r '.registration_token // empty' 2>/dev/null || echo "")
     else
       _AGENT=$(echo "${_REGISTER_RESPONSE}" | uv run python -c 'import sys,json; r=json.load(sys.stdin); c=r.get("result",{}).get("content",[]); print(json.loads(c[0]["text"])["name"] if c else "")' 2>/dev/null || echo "")
+      _REG_TOKEN=$(echo "${_REGISTER_RESPONSE}" | uv run python -c 'import sys,json; r=json.load(sys.stdin); c=r.get("result",{}).get("content",[]); print(json.loads(c[0]["text"]).get("registration_token","") if c else "")' 2>/dev/null || echo "")
     fi
     if [[ -n "${_AGENT}" ]]; then
       log_ok "Registered agent: ${_AGENT}"
     else
       log_warn "Could not parse agent name from response"
+    fi
+    if [[ -z "${_REG_TOKEN}" ]]; then
+      log_warn "Could not parse registration_token from register_agent response."
+      log_warn "The notify hook will silently no-op until this is set (fetch_inbox auth)."
     fi
   else
     log_warn "Failed to register agent"
@@ -195,7 +195,10 @@ else
   log_warn "Could not find codex_notify.sh script"
 fi
 
-# Build the notify command with environment variables wrapper
+# Build the notify command with environment variables wrapper.
+# AGENT_MAIL_REGISTRATION_TOKEN is required for fetch_inbox to authenticate
+# from a notify invocation (each fires its own curl POST and bypasses any
+# persistent MCP-session state).
 NOTIFY_WRAPPER="${HOOKS_DIR}/notify_wrapper.sh"
 write_atomic "$NOTIFY_WRAPPER" <<SH
 #!/usr/bin/env bash
@@ -203,6 +206,7 @@ export AGENT_MAIL_PROJECT='${TARGET_DIR}'
 export AGENT_MAIL_AGENT='${_AGENT}'
 export AGENT_MAIL_URL='${_URL}'
 export AGENT_MAIL_TOKEN='${_TOKEN}'
+export AGENT_MAIL_REGISTRATION_TOKEN='${_REG_TOKEN:-}'
 export AGENT_MAIL_INTERVAL='120'
 exec '${NOTIFY_HOOK}' "\$@"
 SH
@@ -238,13 +242,15 @@ fi
 # Always upsert the MCP URL in-place.
 # Rationale: older installs wrote /mcp/ but the server defaults to /api/. Re-running this installer
 # should fix stale URLs automatically without requiring users to edit config by hand.
-_UPDATED_USER_TOML="$(uv run python - "$USER_TOML" "$_URL" <<'PY'
+_UPDATED_USER_TOML="$(uv run python - "$USER_TOML" "$_URL" "$_MORPH_API_KEY" "$_MORPH_ENABLED_TOOLS" <<'PY'
 import re
 import sys
 from pathlib import Path
 
 path = Path(sys.argv[1])
 url = sys.argv[2]
+morph_key = sys.argv[3]
+morph_enabled = sys.argv[4]
 
 try:
     text = path.read_text(encoding="utf-8")
@@ -255,55 +261,169 @@ except Exception:
 
 lines = text.splitlines(keepends=True)
 
-target_header_re = re.compile(
+agent_header_re = re.compile(
     r'^\s*\[mcp_servers(?:\.mcp_agent_mail|\."mcp_agent_mail"|\.\'mcp_agent_mail\'|\.mcp-agent-mail|\."mcp-agent-mail"|\.\'mcp-agent-mail\')\]\s*(?:#.*)?$'
+)
+morph_env_header_re = re.compile(
+    r'^\s*\[mcp_servers(?:\.morph-mcp|\."morph-mcp"|\.\'morph-mcp\'|\.morph_mcp|\."morph_mcp"|\.\'morph_mcp\')\.env\]\s*(?:#.*)?$'
+)
+morph_header_re = re.compile(
+    r'^\s*\[mcp_servers(?:\.morph-mcp|\."morph-mcp"|\.\'morph-mcp\'|\.morph_mcp|\."morph_mcp"|\.\'morph_mcp\')\]\s*(?:#.*)?$'
 )
 table_header_re = re.compile(r"^\s*\[.*\]\s*(?:#.*)?$")
 url_line_re = re.compile(
     r'^(?P<indent>\s*)url\s*=\s*(?:"[^"]*"|\'[^\']*\'|[^\s#]+)(?P<comment>\s*#.*)?\s*$'
 )
+command_line_re = re.compile(
+    r'^(?P<indent>\s*)command\s*=\s*(?:"[^"]*"|\'[^\']*\'|[^\s#]+)(?P<comment>\s*#.*)?\s*$'
+)
+args_line_re = re.compile(
+    r'^(?P<indent>\s*)args\s*=\s*\[[^\]]*\](?P<comment>\s*#.*)?\s*$'
+)
+enabled_line_re = re.compile(
+    r'^(?P<indent>\s*)ENABLED_TOOLS\s*=\s*(?:"[^"]*"|\'[^\']*\'|[^\s#]+)(?P<comment>\s*#.*)?\s*$'
+)
+key_line_re = re.compile(
+    r'^(?P<indent>\s*)MORPH_API_KEY\s*=\s*(?:"[^"]*"|\'[^\']*\'|[^\s#]+)(?P<comment>\s*#.*)?\s*$'
+)
 
 out: list[str] = []
-in_target = False
-target_found = False
+mode: str | None = None
+agent_found = False
+morph_found = False
+morph_env_found = False
 url_written = False
+command_written = False
+args_written = False
+enabled_written = False
+key_written = False
 
 
 def emit_url(indent: str = "", comment: str = "") -> None:
     out.append(f'{indent}url = "{url}"{comment}\n')
 
 
-for line in lines:
-    if in_target and table_header_re.match(line):
-        if not url_written:
-            emit_url()
-        in_target = False
+def emit_command(indent: str = "", comment: str = "") -> None:
+    out.append(f'{indent}command = "npx"{comment}\n')
 
-    if target_header_re.match(line):
-        in_target = True
-        target_found = True
+
+def emit_args(indent: str = "", comment: str = "") -> None:
+    out.append(f'{indent}args = ["-y", "@morphllm/morphmcp"]{comment}\n')
+
+
+def emit_enabled(indent: str = "", comment: str = "") -> None:
+    out.append(f'{indent}ENABLED_TOOLS = "{morph_enabled}"{comment}\n')
+
+
+def emit_key(indent: str = "", comment: str = "") -> None:
+    out.append(f'{indent}MORPH_API_KEY = "{morph_key}"{comment}\n')
+
+
+def flush_section() -> None:
+    global mode
+
+    if mode == "agent" and not url_written:
+        emit_url()
+    elif mode == "morph" and morph_key:
+        if not command_written:
+            emit_command()
+        if not args_written:
+            emit_args()
+    elif mode == "morph_env" and morph_key:
+        if not enabled_written:
+            emit_enabled()
+        if not key_written:
+            emit_key()
+
+    mode = None
+
+
+for line in lines:
+    if mode and table_header_re.match(line):
+        flush_section()
+
+    if morph_env_header_re.match(line):
+        mode = "morph_env"
+        morph_env_found = True
+        enabled_written = False
+        key_written = False
+        out.append(line if line.endswith("\n") else line + "\n")
+        continue
+
+    if morph_header_re.match(line):
+        mode = "morph"
+        morph_found = True
+        command_written = False
+        args_written = False
+        out.append(line if line.endswith("\n") else line + "\n")
+        continue
+
+    if agent_header_re.match(line):
+        mode = "agent"
+        agent_found = True
         url_written = False
         out.append(line if line.endswith("\n") else line + "\n")
         continue
 
-    if in_target:
+    if mode == "agent":
         m = url_line_re.match(line.rstrip("\r\n"))
         if m:
             emit_url(indent=m.group("indent") or "", comment=m.group("comment") or "")
             url_written = True
             continue
 
+    if mode == "morph":
+        m = command_line_re.match(line.rstrip("\r\n"))
+        if m:
+            emit_command(indent=m.group("indent") or "", comment=m.group("comment") or "")
+            command_written = True
+            continue
+
+        m = args_line_re.match(line.rstrip("\r\n"))
+        if m:
+            emit_args(indent=m.group("indent") or "", comment=m.group("comment") or "")
+            args_written = True
+            continue
+
+    if mode == "morph_env":
+        m = enabled_line_re.match(line.rstrip("\r\n"))
+        if m:
+            emit_enabled(indent=m.group("indent") or "", comment=m.group("comment") or "")
+            enabled_written = True
+            continue
+
+        m = key_line_re.match(line.rstrip("\r\n"))
+        if m:
+            emit_key(indent=m.group("indent") or "", comment=m.group("comment") or "")
+            key_written = True
+            continue
+
     out.append(line if line.endswith("\n") else line + "\n")
 
-if in_target and not url_written:
-    emit_url()
+if mode:
+    flush_section()
 
-if not target_found:
+if not agent_found:
     if out and out[-1].strip():
         out.append("\n")
     out.append("# MCP servers configuration (mcp-agent-mail)\n")
     out.append("[mcp_servers.mcp_agent_mail]\n")
     emit_url()
+
+if morph_key and not morph_found:
+    if out and out[-1].strip():
+        out.append("\n")
+    out.append("# Morph MCP configuration (grep-only to avoid edit-file billing)\n")
+    out.append("[mcp_servers.morph-mcp]\n")
+    emit_command()
+    emit_args()
+
+if morph_key and not morph_env_found:
+    if out and out[-1].strip():
+        out.append("\n")
+    out.append("[mcp_servers.morph-mcp.env]\n")
+    emit_enabled()
+    emit_key()
 
 sys.stdout.write("".join(out))
 PY
@@ -335,6 +455,17 @@ notify = ["${NOTIFY_WRAPPER}"]
 [mcp_servers.mcp_agent_mail]
 url = "${_URL}"
 # headers can be added if needed; localhost allowed without Authorization
+$(if [[ -n "${_MORPH_API_KEY}" ]]; then cat <<TOMLFRAG
+
+[mcp_servers.morph-mcp]
+command = "npx"
+args = ["-y", "@morphllm/morphmcp"]
+
+[mcp_servers.morph-mcp.env]
+ENABLED_TOOLS = "${_MORPH_ENABLED_TOOLS}"
+MORPH_API_KEY = "${_MORPH_API_KEY}"
+TOMLFRAG
+fi)
 TOML
 set_secure_file "$LOCAL_TOML" || true
 

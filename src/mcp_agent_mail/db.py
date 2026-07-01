@@ -22,6 +22,7 @@ import contextvars
 import logging
 import random
 import re
+import threading
 import time
 from collections.abc import AsyncIterator, Callable, Iterator
 from contextlib import asynccontextmanager, contextmanager, suppress
@@ -29,7 +30,7 @@ from dataclasses import dataclass, field
 from enum import Enum
 from functools import wraps
 from pathlib import Path
-from typing import Any, TypeVar
+from typing import Any, Final, TypeVar, cast
 
 from sqlalchemy.exc import OperationalError, TimeoutError as SATimeoutError
 from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, async_sessionmaker, create_async_engine
@@ -263,9 +264,9 @@ def retry_on_db_lock(
             for attempt in range(max_retries + 1):
                 try:
                     result = await func(*args, **kwargs)
-                    # Success - reset circuit breaker
-                    if use_circuit_breaker and attempt > 0:
-                        # Only record success if we had retries (indicates recovery)
+                    # Success - reset circuit breaker if it had any accumulated failures,
+                    # even on the first attempt (allows recovery from HALF_OPEN state).
+                    if use_circuit_breaker and _circuit_breaker_failures > 0:
                         await _record_circuit_success()
                     return result
 
@@ -524,12 +525,59 @@ def install_query_hooks(engine: AsyncEngine) -> None:
     _QUERY_HOOKS_INSTALLED = True
 
 
+class UnsupportedDatabaseBackendError(RuntimeError):
+    """Raised at startup when DATABASE_URL points at an unsupported backend.
+
+    As of this version, mcp-agent-mail only supports SQLite as the backing
+    store. Large portions of the application (FTS5 full-text search, many
+    SQLite-specific PRAGMAs, ``ALTER TABLE ADD COLUMN`` idempotency) assume
+    SQLite. PostgreSQL / MySQL / etc. will silently mis-behave or fail at
+    schema init with cryptic errors (see issue #142 for the historical
+    ``CREATE VIRTUAL TABLE`` failure).
+
+    We fail fast with a clear, actionable error instead.
+    """
+
+
+_SUPPORTED_BACKENDS: Final = frozenset({"sqlite"})
+
+
+def _assert_supported_backend(database_url: str) -> None:
+    """Reject DATABASE_URLs that target backends we don't actually support.
+
+    Accepts empty / unparseable URLs silently — those will produce their own
+    errors downstream in :func:`_build_engine`. Only raises for URLs that
+    parse cleanly but point at a known non-SQLite backend (e.g.
+    ``postgresql+asyncpg://...``).
+    """
+    if not database_url:
+        return
+    try:
+        from sqlalchemy.engine import make_url
+
+        backend = make_url(database_url).get_backend_name().lower()
+    except Exception:
+        return
+    if backend in _SUPPORTED_BACKENDS:
+        return
+    raise UnsupportedDatabaseBackendError(
+        "DATABASE_URL points at an unsupported backend "
+        f"({backend!r}). mcp-agent-mail currently only supports SQLite "
+        "(e.g. 'sqlite+aiosqlite:////data/mailbox/storage.sqlite3'). "
+        "PostgreSQL / MySQL / etc. are not yet implemented — core features "
+        "(full-text search via FTS5, schema migrations, PRAGMA-based tuning) "
+        "assume SQLite. Track support in "
+        "https://github.com/Dicklesworthstone/mcp_agent_mail/issues/142."
+    )
+
+
 def init_engine(settings: Settings | None = None) -> None:
     """Initialise global engine and session factory once."""
     global _engine, _session_factory
     if _engine is not None and _session_factory is not None:
         return
     resolved_settings = settings or get_settings()
+    _assert_supported_backend(resolved_settings.database.url)
     engine = _build_engine(resolved_settings.database)
     install_query_hooks(engine)
     _engine = engine
@@ -583,12 +631,62 @@ async def get_session(*, check_circuit_breaker: bool = False) -> AsyncIterator[A
     finally:
         # Ensure session close completes even under cancellation (anyio cancel scopes
         # will raise asyncio.CancelledError which is BaseException in Python 3.14).
-        close_task = asyncio.create_task(session.close())
         try:
-            await asyncio.shield(close_task)
+            await asyncio.shield(session.close())
         except BaseException:
             with suppress(BaseException):
-                await close_task
+                await session.close()
+            raise
+
+
+@asynccontextmanager
+async def get_immediate_session(*, check_circuit_breaker: bool = False) -> AsyncIterator[AsyncSession]:
+    """Provide an async database session that begins with ``BEGIN IMMEDIATE``.
+
+    This forces SQLite to acquire a *reserved lock* at the start of the
+    transaction, which in WAL mode guarantees that all subsequent reads see
+    the latest committed state (a fresh WAL snapshot).  Without this, a
+    pooled connection may re-use a stale read snapshot, causing:
+
+    - Phantom conflicts after a release (#130 / Rust Bug #85)
+    - Missed conflicts before an insert (#129 / Rust Bug #86)
+
+    The session is otherwise identical to :func:`get_session` — callers
+    should ``await session.commit()`` on the success path; the finally
+    block rolls back any uncommitted changes and closes the session.
+
+    **Only use this for reservation operations** (or other paths that
+    require serialised read-then-write consistency).  Regular reads should
+    continue using :func:`get_session` to avoid unnecessary write-lock
+    contention.
+    """
+    if check_circuit_breaker:
+        state = get_circuit_state()
+        if state == CircuitState.OPEN:
+            raise CircuitBreakerOpenError(
+                "Circuit breaker is open for database operations. "
+                "This typically indicates sustained database lock contention."
+            )
+
+    factory = get_session_factory()
+    session = factory()
+    try:
+        # Obtain the underlying connection and issue BEGIN IMMEDIATE *before*
+        # SQLAlchemy's autobegin can issue a plain BEGIN.
+        conn = await session.connection()
+        await conn.exec_driver_sql("BEGIN IMMEDIATE")
+        yield session
+    except BaseException:
+        # Roll back on any error so the IMMEDIATE lock is released.
+        with suppress(BaseException):
+            await session.rollback()
+        raise
+    finally:
+        try:
+            await asyncio.shield(session.close())
+        except BaseException:
+            with suppress(BaseException):
+                await session.close()
             raise
 
 
@@ -605,13 +703,13 @@ def get_db_health_status() -> dict[str, Any]:
     }
 
     if _engine is not None:
-        pool = _engine.pool
+        pool = cast(Any, _engine.pool)
         # Pool attributes are available at runtime but not in type stubs
         status["pool"] = {
-            "size": pool.size(),  # type: ignore[attr-defined]
-            "checked_in": pool.checkedin(),  # type: ignore[attr-defined]
-            "checked_out": pool.checkedout(),  # type: ignore[attr-defined]
-            "overflow": pool.overflow(),  # type: ignore[attr-defined]
+            "size": pool.size(),
+            "checked_in": pool.checkedin(),
+            "checked_out": pool.checkedout(),
+            "overflow": pool.overflow(),
         }
 
     if state == CircuitState.OPEN:
@@ -664,29 +762,12 @@ async def ensure_schema(settings: Settings | None = None) -> None:
 
 def reset_database_state() -> None:
     """Test helper to reset global engine/session state."""
-    global _engine, _session_factory, _schema_ready, _schema_lock
+    global _engine, _session_factory, _schema_ready, _schema_lock, _QUERY_HOOKS_INSTALLED
     # Dispose any existing engine/pool first to avoid leaking file descriptors across tests.
     if _engine is not None:
         engine = _engine
         try:
-            # Prefer a full async dispose when possible (aiosqlite uses background threads).
-            try:
-                running = asyncio.get_running_loop()
-            except RuntimeError:
-                running = None
-
-            if running is not None and running.is_running():
-                # Can't block; fall back to sync pool disposal (best effort).
-                engine.sync_engine.dispose()
-            else:
-                try:
-                    loop = asyncio.get_event_loop()
-                except RuntimeError:
-                    loop = None
-                if loop is not None and not loop.is_running() and not loop.is_closed():
-                    loop.run_until_complete(engine.dispose())
-                else:
-                    asyncio.run(engine.dispose())
+            dispose_engine_blocking(engine)
         except Exception:
             # Last resort: sync pool disposal.
             with suppress(Exception):
@@ -695,11 +776,62 @@ def reset_database_state() -> None:
     _session_factory = None
     _schema_ready = False
     _schema_lock = None
+    # Query hooks bind to the disposed engine; reset the one-shot flag so the
+    # rebuilt engine gets re-instrumented on the next init_engine() call.
+    _QUERY_HOOKS_INSTALLED = False
     # Tests frequently mutate env vars; keep settings cache in sync with DB resets.
     clear_settings_cache()
 
 
+def dispose_engine_blocking(engine: AsyncEngine, timeout_seconds: float = 5.0) -> None:
+    """Dispose an async engine in a helper thread so shutdown survives active event loops/cancellation."""
+    dispose_error: BaseException | None = None
+
+    def _dispose_in_thread() -> None:
+        nonlocal dispose_error
+        try:
+            asyncio.run(engine.dispose())
+        except BaseException as exc:  # pragma: no cover - best-effort fallback path
+            dispose_error = exc
+
+    dispose_thread = threading.Thread(target=_dispose_in_thread, name="db-dispose", daemon=True)
+    dispose_thread.start()
+    dispose_thread.join(timeout=timeout_seconds)
+    if dispose_thread.is_alive():
+        raise TimeoutError("Timed out waiting for async engine disposal in helper thread.")
+    if dispose_error is not None:
+        raise dispose_error
+
+
+def _is_sqlite_connection(connection: Any) -> bool:
+    """Best-effort check that a SQLAlchemy sync Connection is backed by SQLite.
+
+    Used to gate SQLite-only DDL (FTS5 virtual tables, SQLite-idiom ALTERs)
+    so the schema initializer still works for other backends that may be
+    added in the future. As of this version, non-SQLite backends are not
+    supported at runtime (see ``_assert_supported_backend``).
+    """
+    try:
+        dialect = getattr(getattr(connection, "engine", None), "dialect", None)
+        name = getattr(dialect, "name", "") or ""
+        return name.lower() == "sqlite"
+    except Exception:
+        return False
+
+
 def _setup_fts(connection: Any) -> None:
+    # FTS5 + the ``ALTER TABLE`` idioms below are SQLite-only. Skip them
+    # entirely on other backends so schema init does not blow up with
+    # ``CREATE VIRTUAL TABLE`` against Postgres et al. Runtime search paths
+    # also short-circuit to LIKE fallbacks when FTS is unavailable.
+    if not _is_sqlite_connection(connection):
+        engine = getattr(connection, "engine", None)
+        dialect_name = getattr(getattr(engine, "dialect", None), "name", "unknown")
+        _logger.info(
+            "db.fts.skipped_non_sqlite",
+            extra={"dialect": dialect_name},
+        )
+        return
     connection.exec_driver_sql(
         "CREATE VIRTUAL TABLE IF NOT EXISTS fts_messages USING fts5(message_id UNINDEXED, subject, body)"
     )
@@ -747,7 +879,8 @@ def _setup_fts(connection: Any) -> None:
         "CREATE INDEX IF NOT EXISTS idx_messages_sender_created ON messages(sender_id, created_ts DESC)"
     )
     connection.exec_driver_sql(
-        "CREATE INDEX IF NOT EXISTS idx_messages_project_created ON messages(project_id, created_ts DESC)"
+        "CREATE INDEX IF NOT EXISTS idx_messages_project_created_desc "
+        "ON messages(project_id, created_ts DESC)"
     )
     connection.exec_driver_sql(
         "CREATE INDEX IF NOT EXISTS idx_file_reservations_expires_ts ON file_reservations(expires_ts)"
@@ -760,7 +893,7 @@ def _setup_fts(connection: Any) -> None:
         "ON message_recipients(agent_id, message_id)"
     )
     connection.exec_driver_sql(
-        "CREATE INDEX IF NOT EXISTS idx_messages_project_sender_created "
+        "CREATE INDEX IF NOT EXISTS idx_messages_project_sender_created_desc "
         "ON messages(project_id, sender_id, created_ts DESC)"
     )
     connection.exec_driver_sql(
@@ -799,18 +932,20 @@ def _setup_fts(connection: Any) -> None:
         "ALTER TABLE projects ADD COLUMN archived_at DATETIME DEFAULT NULL",
         "ALTER TABLE agents ADD COLUMN registration_token VARCHAR(64) DEFAULT NULL",
         "ALTER TABLE messages ADD COLUMN topic VARCHAR(64) DEFAULT NULL",
+        # #188: persist the direct parent→child reply edge so replies survive a
+        # round-trip through the DB (previously reply_to lived only in the
+        # response payload and was lost on read).
+        "ALTER TABLE messages ADD COLUMN reply_to INTEGER DEFAULT NULL",
     ]:
-        try:
+        with suppress(Exception):  # Column already exists — safe to ignore
             connection.exec_driver_sql(migration_sql)
-        except Exception:
-            # Column already exists — safe to ignore
-            pass
 
     # Index migrations for newly added columns.
     # CREATE INDEX IF NOT EXISTS is natively idempotent in SQLite.
     for index_sql in [
         "CREATE INDEX IF NOT EXISTS ix_agents_registration_token ON agents (registration_token)",
         "CREATE INDEX IF NOT EXISTS idx_messages_project_topic ON messages (project_id, topic)",
+        "CREATE INDEX IF NOT EXISTS ix_messages_reply_to ON messages (reply_to)",
     ]:
         connection.exec_driver_sql(index_sql)
 
@@ -842,3 +977,16 @@ def get_database_path(settings: Settings | None = None) -> Path | None:
         return None
 
     return Path(db_path)
+
+
+def get_sqlite_sidecar_paths(db_path: Path) -> tuple[Path, Path]:
+    """Return the WAL and SHM sidecar paths for a SQLite database file."""
+    return (
+        db_path.with_name(f"{db_path.name}-wal"),
+        db_path.with_name(f"{db_path.name}-shm"),
+    )
+
+
+def get_sqlite_pre_restore_path(db_path: Path) -> Path:
+    """Return the safety-backup path used before overwriting a SQLite database."""
+    return db_path.with_name(f"{db_path.name}.pre-restore")
