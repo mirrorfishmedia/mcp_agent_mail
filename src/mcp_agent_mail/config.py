@@ -532,7 +532,7 @@ def _build_settings() -> Settings:
         return "include"
 
     tool_filter_settings = ToolFilterSettings(
-        enabled=_bool(_decouple_config("TOOLS_FILTER_ENABLED", default="false"), default=False),
+        enabled=_bool(_decouple_config("TOOLS_FILTER_ENABLED", default="false"), default=False, key="TOOLS_FILTER_ENABLED"),
         profile=_tool_filter_profile(_decouple_config("TOOLS_FILTER_PROFILE", default="full")),
         mode=_tool_filter_mode(_decouple_config("TOOLS_FILTER_MODE", default="include")),
         clusters=_csv("TOOLS_FILTER_CLUSTERS", default=""),
@@ -540,10 +540,10 @@ def _build_settings() -> Settings:
     )
 
     notification_settings = NotificationSettings(
-        enabled=_bool(_decouple_config("NOTIFICATIONS_ENABLED", default="false"), default=False),
+        enabled=_bool(_decouple_config("NOTIFICATIONS_ENABLED", default="false"), default=False, key="NOTIFICATIONS_ENABLED"),
         signals_dir=_decouple_config("NOTIFICATIONS_SIGNALS_DIR", default="~/.mcp_agent_mail/signals"),
-        include_metadata=_bool(_decouple_config("NOTIFICATIONS_INCLUDE_METADATA", default="true"), default=True),
-        debounce_ms=_int(_decouple_config("NOTIFICATIONS_DEBOUNCE_MS", default="100"), default=100),
+        include_metadata=_bool(_decouple_config("NOTIFICATIONS_INCLUDE_METADATA", default="true"), default=True, key="NOTIFICATIONS_INCLUDE_METADATA"),
+        debounce_ms=_int(_decouple_config("NOTIFICATIONS_DEBOUNCE_MS", default="100"), default=100, key="NOTIFICATIONS_DEBOUNCE_MS"),
     )
 
     def _agent_name_mode(value: str) -> str:
