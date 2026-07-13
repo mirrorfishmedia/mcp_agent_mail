@@ -4,6 +4,12 @@
 
 > "It's like gmail for your coding agents!"
 
+> **ℹ️ Retired in the Cloude Factory setup (Jul 2026).** In Matt's own multi-machine
+> (VPS · Mac · Brooklyn PC) system this project has been superseded by **`coord`**
+> (`agent-coord`) for live agent coordination — presence, claims, soft leases, messages,
+> and handoffs over a single always-on coordinator. This note reflects that internal
+> deployment decision only; the codebase itself remains here for reference and history.
+
 A mail-like coordination layer for coding agents, exposed as an HTTP-only FastMCP server. It gives agents memorable identities, an inbox/outbox, searchable message history, and voluntary file reservation "leases" to avoid stepping on each other.
 
 Think of it as asynchronous email + directory + change-intent signaling for your agents, backed by Git (for human-auditable artifacts) and SQLite (for indexing and queries).
